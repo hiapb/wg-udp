@@ -43,7 +43,6 @@ install_udp2raw() {
   TMP_DIR=$(mktemp -d)
   cd "$TMP_DIR"
 
-  # 官方 release 里只有 udp2raw_binaries.tar.gz
   URL="https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"
   echo "  - 下载: $URL"
   if ! curl -L -o udp2raw_binaries.tar.gz "$URL"; then
@@ -56,10 +55,8 @@ install_udp2raw() {
     return
   }
 
-  # 尝试找 amd64 二进制
   UDP2RAW_CANDIDATE=$(find . -maxdepth 2 -type f -name "udp2raw_amd64*" | head -n1 || true)
   if [[ -z "$UDP2RAW_CANDIDATE" ]]; then
-    # 退一步，找任意 udp2raw*
     UDP2RAW_CANDIDATE=$(find . -maxdepth 2 -type f -name "udp2raw*" | head -n1 || true)
   fi
 
@@ -158,13 +155,11 @@ configure_exit() {
   read -rp "请输入【入口服务器公钥】(如果暂时没有可以直接回车占位): " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
-  # 开启 IPv4 转发
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   fi
 
-  # 出口 wg0 只在本地 51820 等待 udp2raw 转发
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -185,7 +180,6 @@ EOF
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
 
-  # 创建 udp2raw 服务（服务端）
   cat > /etc/systemd/system/udp2raw-wg0.service <<EOF
 [Unit]
 Description=udp2raw for WireGuard wg0 (server)
@@ -283,21 +277,12 @@ enable_global_mode() {
   ensure_policy_routing_for_ports
   clear_mangle_output
 
-  # 不处理 lo
   iptables -t mangle -A OUTPUT -o lo -j RETURN
-
-  # 保证 SSH 不被标记（源端口 22）
   iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
-
-  # 保证 WireGuard 隧道本身不被标记
   iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
   iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
-
-  # 保证 DNS 查询直接走本机，不走 wg
   iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
   iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
-
-  # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
   iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
   set_mode_flag "global"
@@ -377,7 +362,6 @@ configure_entry() {
   fi
   echo "$EXIT_PUBLIC_IP" > /etc/wireguard/.exit_public_ip
 
-  # udp2raw 参数（必须与出口保持一致）
   DEFAULT_U2R_PORT="4000"
   if [[ -f "$UDP2RAW_PORT_FILE" ]]; then
     DEFAULT_U2R_PORT=$(cat "$UDP2RAW_PORT_FILE" 2>/dev/null || echo "4000")
@@ -397,9 +381,15 @@ configure_entry() {
     exit 1
   fi
 
-  # 本地 udp2raw 监听端口（入口本机，由 wg 使用）
   read -rp "入口本地 udp2raw 监听端口 (默认 4000): " LOCAL_U2R_PORT
   LOCAL_U2R_PORT=${LOCAL_U2R_PORT:-4000}
+
+  # ★★★ 新增：让你直接填出口公钥 ★★★
+  read -rp "请输入【出口服务器公钥】(必填): " EXIT_PUBLIC_KEY
+  if [[ -z "$EXIT_PUBLIC_KEY" ]]; then
+    echo "❌ 出口服务器公钥不能为空。"
+    exit 1
+  fi
 
   cd /etc/wireguard
 
@@ -424,7 +414,6 @@ configure_entry() {
   echo "================================================"
   echo
 
-  # 入口 wg0：Endpoint 指向本地 udp2raw 端口
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -435,7 +424,7 @@ PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 
 PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true
 
 [Peer]
-PublicKey = CHANGE_ME_EXIT_PUBLIC_KEY
+PublicKey = ${EXIT_PUBLIC_KEY}
 Endpoint = 127.0.0.1:${LOCAL_U2R_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
@@ -449,11 +438,9 @@ EOF
 
   ensure_policy_routing_for_ports
 
-  # 默认先用端口分流模式（更安全）
   set_mode_flag "split"
   apply_current_mode
 
-  # 创建 udp2raw 服务（客户端）
   cat > /etc/systemd/system/udp2raw-wg0.service <<EOF
 [Unit]
 Description=udp2raw for WireGuard wg0 (client)
@@ -482,7 +469,6 @@ EOF
   echo "✅ 之后如果要切换："
   echo "  - 用本脚本菜单 8 管理端口分流（添加/删除入口本地源端口）。"
   echo "  - 用本脚本菜单 9 在【全局模式】 / 【端口分流模式】之间切换。"
-  echo "  - 确保出口 wg.conf 的 [Peer] 公钥改成上面的入口公钥，Endpoint 继续保持 udp2raw 服务端的本地 127.0.0.1:51820。"
 }
 
 manage_entry_ports() {
@@ -580,7 +566,7 @@ restart_wg() {
   wg-quick up ${WG_IF} || true
   ensure_policy_routing_for_ports
   apply_current_mode
-  systemctl restart udp2raw-wg0.service 2>/div/null || true
+  systemctl restart udp2raw-wg0.service 2>/dev/null || true
   wg show || true
 }
 
@@ -642,7 +628,7 @@ while true; do
   echo
   echo "================ WireGuard + udp2raw 一键脚本 ================"
   echo "1) 配置为 出口服务器 (WG + udp2raw 服务端)"
-  echo "2) 配置为 入口服务器 (WG + udp2raw 客户端，只配一次)"
+  echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard / udp2raw 状态"
   echo "4) 启动 WireGuard + udp2raw"
   echo "5) 停止 WireGuard + udp2raw"
