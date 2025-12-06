@@ -218,9 +218,18 @@ configure_exit() {
   read -rp "请输入【入口服务器公钥】: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
-  # udp2raw 监听端口
-  read -rp "udp2raw 出口服务端监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}): " UDP2RAW_PORT
+  # 选择 udp2raw 监听端口，禁止 89
+  local UDP2RAW_PORT
+  read -rp "udp2raw 出口服务端监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}，禁止使用 89): " UDP2RAW_PORT
   UDP2RAW_PORT=${UDP2RAW_PORT:-$UDP2RAW_DEFAULT_PORT}
+  if [[ "$UDP2RAW_PORT" == "89" ]]; then
+    echo "❌ 端口 89 不允许作为出口 udp2raw 端口，请重新运行脚本并选择其他端口。"
+    return
+  fi
+  if ! [[ "$UDP2RAW_PORT" =~ ^[0-9]+$ ]] || [ "$UDP2RAW_PORT" -lt 1 ] || [ "$UDP2RAW_PORT" -gt 65535 ]; then
+    echo "❌ udp2raw 端口不合法，退出。"
+    return
+  fi
 
   # PSK
   local DEFAULT_PSK
@@ -246,12 +255,13 @@ configure_exit() {
 Address = ${WG_ADDR}
 ListenPort = 51820
 PrivateKey = ${EXIT_PRIVATE_KEY}
+MTU = 1380
 
 PostUp   = iptables -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -A FORWARD -o ${WG_IF} -j ACCEPT
 PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || true
 
 [Peer]
-PublicKey = ${ENTRY_PUBLIC_KEY}
+PublicKey = ${ENTRY_WG_IP:+${ENTRY_PUBLIC_KEY}}
 AllowedIPs = ${ENTRY_WG_IP}
 EOF
 
@@ -357,17 +367,43 @@ enable_global_mode() {
   ensure_policy_routing_for_ports
   clear_mark_rules
 
+  # 读取 udp2raw 远端端口（客户端向这个端口发包）
+  local UDP2RAW_REMOTE_PORT="$UDP2RAW_DEFAULT_PORT"
+  if [[ -f "$UDP2RAW_REMOTE_FILE" ]]; then
+    local remote_str
+    remote_str=$(cat "$UDP2RAW_REMOTE_FILE" 2>/dev/null || true)
+    if [[ "$remote_str" == *:* ]]; then
+      UDP2RAW_REMOTE_PORT="${remote_str##*:}"
+    fi
+  fi
+
+  # 不处理 lo
   iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -o lo -j RETURN
 
+  # 保护 SSH
   iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
 
+  # 保护 WireGuard 本身
   iptables -t mangle -C OUTPUT -p udp --sport 51820 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
   iptables -t mangle -C OUTPUT -p udp --dport 51820 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
 
+  # 保护 DNS
+  iptables -t mangle -C OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
+  iptables -t mangle -C OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
+
+  # 保护 udp2raw 通道（发往出口 udp2raw 的流量）
+  iptables -t mangle -C OUTPUT -p tcp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN
+  iptables -t mangle -C OUTPUT -p udp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN
+
+  # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
   iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
@@ -467,6 +503,7 @@ configure_entry() {
 
   read -rp "出口服务器 udp2raw 监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}): " UDP2RAW_REMOTE_PORT
   UDP2RAW_REMOTE_PORT=${UDP2RAW_REMOTE_PORT:-$UDP2RAW_DEFAULT_PORT}
+
   read -rp "本机 udp2raw 本地监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}): " UDP2RAW_LOCAL_PORT
   UDP2RAW_LOCAL_PORT=${UDP2RAW_LOCAL_PORT:-$UDP2RAW_DEFAULT_PORT}
 
@@ -491,6 +528,7 @@ configure_entry() {
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
+MTU = 1380
 
 PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE
 PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
@@ -681,7 +719,7 @@ while true; do
   echo "4) 启动 WireGuard"
   echo "5) 停止 WireGuard"
   echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard + udp2raw + 本脚本"
+  echo "7) 卸载 WireGuard + udp2raw"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "0) 退出"
