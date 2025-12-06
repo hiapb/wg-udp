@@ -646,14 +646,14 @@ show_status() {
   fi
 
   echo
-  echo "==== udp2raw 服务状态（如有） ===="
+  echo "==== udp2raw 服务状态 ===="
   systemctl status udp2raw-exit.service 2>/dev/null | sed -n '1,5p' || echo "udp2raw-exit.service 不存在或未运行。"
   echo
   systemctl status udp2raw-entry.service 2>/dev/null | sed -n '1,5p' || echo "udp2raw-entry.service 不存在或未运行。"
 }
 
 start_wg() {
-  echo "[*] 启动 WireGuard (${WG_IF})..."
+  echo "[*] 启动 WG-Raw (${WG_IF})..."
   wg-quick up ${WG_IF} || true
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
   ensure_policy_routing_for_ports
@@ -662,13 +662,13 @@ start_wg() {
 }
 
 stop_wg() {
-  echo "[*] 停止 WireGuard (${WG_IF})..."
+  echo "[*] 停止 WG-Raw (${WG_IF})..."
   wg-quick down ${WG_IF} || true
   wg show || true
 }
 
 restart_wg() {
-  echo "[*] 重启 WireGuard (${WG_IF})..."
+  echo "[*] 重启 WG-Raw (${WG_IF})..."
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF} || true
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
@@ -678,7 +678,7 @@ restart_wg() {
 }
 
 uninstall_wg() {
-  echo "==== 卸载 WireGuard 与 udp2raw ===="
+  echo "==== 卸载 WG-Raw ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
   echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
@@ -734,14 +734,14 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ WireGuard 一键脚本 ================"
+  echo "================ 📡 WG-Raw 一键脚本 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
-  echo "3) 查看 WireGuard / udp2raw 状态"
-  echo "4) 启动 WireGuard"
-  echo "5) 停止 WireGuard"
-  echo "6) 重启 WireGuard"
-  echo "7) 卸载 WireGuard + udp2raw"
+  echo "3) 查看 WG-Raw 状态"
+  echo "4) 启动 WG-Raw"
+  echo "5) 停止 WG-Raw"
+  echo "6) 重启 WG-Raw"
+  echo "7) 卸载 WG-Raw"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "0) 退出"
