@@ -633,7 +633,7 @@ while true; do
   echo "4) 启动 WireGuard + udp2raw"
   echo "5) 停止 WireGuard + udp2raw"
   echo "6) 重启 WireGuard + udp2raw"
-  echo "7) 卸载 WireGuard + udp2raw（并删除脚本）"
+  echo "7) 卸载 WireGuard + udp2raw"
   echo "8) 管理入口端口分流（添加/查看/删除）"
   echo "9) 管理入口模式（全局 / 端口分流）"
   echo "0) 退出"
