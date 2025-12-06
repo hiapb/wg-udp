@@ -674,7 +674,7 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ WireGuard 一键脚本（强制 udp2raw） ================"
+  echo "================ WireGuard 一键脚本 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WireGuard / udp2raw 状态"
