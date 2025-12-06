@@ -13,7 +13,10 @@ UDP2RAW_CLIENT_PORT_FILE="${UDP2RAW_WORKDIR}/client_port"
 UDP2RAW_SERVER_PORT_FILE="${UDP2RAW_WORKDIR}/server_port"
 UDP2RAW_REMOTE_FILE="${UDP2RAW_WORKDIR}/remote"
 
-# 不常见的默认端口
+# 统一安全 MTU
+WG_SAFE_MTU=1320
+
+# 不常见的默认 udp2raw 端口
 UDP2RAW_DEFAULT_PORT=40008
 
 if [[ $EUID -ne 0 ]]; then
@@ -255,13 +258,13 @@ configure_exit() {
 Address = ${WG_ADDR}
 ListenPort = 51820
 PrivateKey = ${EXIT_PRIVATE_KEY}
-MTU = 1380
+MTU = ${WG_SAFE_MTU}
 
-PostUp   = iptables -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -A FORWARD -o ${WG_IF} -j ACCEPT
-PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || true
+PostUp   = iptables -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -A FORWARD -o ${WG_IF} -j ACCEPT; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 [Peer]
-PublicKey = ${ENTRY_WG_IP:+${ENTRY_PUBLIC_KEY}}
+PublicKey = ${ENTRY_PUBLIC_KEY}
 AllowedIPs = ${ENTRY_WG_IP}
 EOF
 
@@ -270,6 +273,9 @@ EOF
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
+
+  # 再安全兜底设一遍 MTU（防旧配置残留）
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} || true
 
   setup_udp2raw_server 51820 "$UDP2RAW_PORT" "$UDP2RAW_PSK"
 
@@ -290,7 +296,7 @@ EOF
 # ====================== 入口通用函数 ======================
 
 ensure_policy_routing_for_ports() {
-  if ! ip link show "${WG_IF}" &>/dev/null; then
+  if ! ip link show "${WG_IF}" &>/divnull; then
     return 0
   fi
   if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
@@ -403,9 +409,16 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -p udp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --dport "${UDP2RAW_REMOTE_PORT}" -j RETURN
 
+  # 再加 TCPMSS（入口自己发出的 TCP）
+  iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+
   # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
   iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
+
+  # 兜底再设一遍 wg0 MTU
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   set_mode_flag "global"
   echo "✅ 已切到【全局模式】，全部流量默认通过出口。"
@@ -416,6 +429,10 @@ enable_split_mode() {
   ensure_policy_routing_for_ports
   clear_mark_rules
   apply_port_rules_from_file
+
+  # 分流模式下同样兜底 wg0 MTU
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
+
   set_mode_flag "split"
   echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
 }
@@ -528,10 +545,10 @@ configure_entry() {
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
-MTU = 1380
+MTU = ${WG_SAFE_MTU}
 
-PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE
-PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
+PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
 [Peer]
 PublicKey = ${EXIT_PUBLIC_KEY}
@@ -545,6 +562,9 @@ EOF
   systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
+
+  # 兜底设置 MTU
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   ensure_policy_routing_for_ports
   set_mode_flag "split"
@@ -635,6 +655,7 @@ show_status() {
 start_wg() {
   echo "[*] 启动 WireGuard (${WG_IF})..."
   wg-quick up ${WG_IF} || true
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
   ensure_policy_routing_for_ports
   apply_current_mode
   wg show || true
@@ -650,6 +671,7 @@ restart_wg() {
   echo "[*] 重启 WireGuard (${WG_IF})..."
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF} || true
+  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
   ensure_policy_routing_for_ports
   apply_current_mode
   wg show || true
