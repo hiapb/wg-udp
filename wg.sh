@@ -185,7 +185,7 @@ configure_exit() {
 
   PUB_IP_DETECTED=$(detect_public_ip || true)
   if [[ -n "$PUB_IP_DETECTED" ]]; then
-    echo "[*] 检测到出口服务器公网 IP 可能是：$PUB_IP_DETECTED"
+    echo "[*] 检测到出口服务器公网 IP：$PUB_IP_DETECTED"
   else
     echo "[*] 未能自动检测公网 IP，请查看服务商面板。"
   fi
@@ -223,7 +223,7 @@ configure_exit() {
 
   # 选择 udp2raw 监听端口，禁止 89
   local UDP2RAW_PORT
-  read -rp "udp2raw 出口服务端监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}，禁止使用 89): " UDP2RAW_PORT
+  read -rp "udp2raw 出口服务端监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}): " UDP2RAW_PORT
   UDP2RAW_PORT=${UDP2RAW_PORT:-$UDP2RAW_DEFAULT_PORT}
   if [[ "$UDP2RAW_PORT" == "89" ]]; then
     echo "❌ 端口 89 不允许作为出口 udp2raw 端口，请重新运行脚本并选择其他端口。"
@@ -241,7 +241,7 @@ configure_exit() {
   else
     DEFAULT_PSK=$(head -c 16 /dev/urandom | base64)
   fi
-  read -rp "udp2raw 预共享密钥 PSK (默认使用当前/自动生成的): " UDP2RAW_PSK
+  read -rp "udp2raw 预共享密钥 PSK (默认自动生成): " UDP2RAW_PSK
   UDP2RAW_PSK=${UDP2RAW_PSK:-$DEFAULT_PSK}
 
   # 开启 IPv4 转发 + NAT
@@ -513,7 +513,7 @@ configure_entry() {
   ENTRY_PUBLIC_KEY=$(cat entry_public.key)
 
   echo
-  echo "====== 入口服务器 公钥（发给出口服务器用）======"
+  echo "====== 入口服务器 公钥（出口服务器用）======"
   echo "${ENTRY_PUBLIC_KEY}"
   echo "================================================"
   echo
@@ -530,7 +530,7 @@ configure_entry() {
   else
     DEFAULT_PSK=$(head -c 16 /dev/urandom | base64)
   fi
-  read -rp "请输入与出口服务器一致的 udp2raw PSK (默认使用当前/自动生成的): " UDP2RAW_PSK
+  read -rp "请输入与出口服务器一致的 udp2raw PSK: " UDP2RAW_PSK
   UDP2RAW_PSK=${UDP2RAW_PSK:-$DEFAULT_PSK}
 
   setup_udp2raw_client "$EXIT_PUBLIC_IP" "$UDP2RAW_REMOTE_PORT" "$UDP2RAW_LOCAL_PORT" "$UDP2RAW_PSK"
