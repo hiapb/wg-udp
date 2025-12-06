@@ -369,7 +369,7 @@ set_mode_flag() {
   echo "$mode" > "$MODE_FILE"
 }
 
-# === 新增：入口 A 把指定端口转发到出口 B 的同端口（O→A→B 场景） ===
+# === 新增：一些公共小工具 ===
 
 enable_ip_forward_global() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -383,6 +383,8 @@ get_wan_if() {
   wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
   echo "${wan:-eth0}"
 }
+
+# === 新增：入口 A 把“指定端口”转发到出口 B 的同端口（用于分流模式下的 O→A→B） ===
 
 add_forward_port_mapping() {
   local port="$1"
@@ -441,6 +443,45 @@ remove_forward_port_mapping() {
   echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
 
+# === 新增：全局模式下的“全端口 1:1 转发 A→B” ===
+
+enable_full_port_forward_to_exit_all() {
+  local exit_ip
+  local wan_if
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$exit_ip" ]]; then
+    echo "⚠ 未找到出口 WG 内网 IP (${EXIT_WG_IP_FILE})，跳过全端口 1:1 转发配置。"
+    return 0
+  fi
+
+  enable_ip_forward_global
+  wan_if=$(get_wan_if)
+
+  echo "[*] 开启【全端口 1:1 转发】：A 公网 IP:任意 TCP 端口 → B(${exit_ip}):同端口（经 ${WG_IF}）"
+  echo "    外网网卡: ${wan_if}"
+
+  # 1) PREROUTING：所有从外网进来的 TCP，DNAT 到 B（端口保持不变）
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}"
+
+  # 2) FORWARD：外网 -> wg0 放行
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+
+  # 3) FORWARD：wg0 -> 外网 放行回程
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # 4) 出 wg0 做 SNAT/MASQUERADE
+  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+
+  echo "✅ 已开启【全端口 1:1 转发】：O → A:任意 TCP 端口 = O → B(${exit_ip}):同端口"
+}
+
 enable_global_mode() {
   echo "[*] 切换为【全局模式】..."
   ensure_policy_routing_for_ports
@@ -493,8 +534,11 @@ enable_global_mode() {
   # 兜底再设一遍 wg0 MTU
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
+  # 全局模式下，同时开启【全端口 1:1 A→B 转发】
+  enable_full_port_forward_to_exit_all
+
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，全部流量默认通过出口。"
+  echo "✅ 已切到【全局模式】，本机出站全走出口，且 A 公网所有 TCP 端口 1:1 映射到出口 B。"
 }
 
 enable_split_mode() {
@@ -507,7 +551,7 @@ enable_split_mode() {
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   set_mode_flag "split"
-  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口（外部只转发已添加端口）。"
 }
 
 apply_current_mode() {
@@ -655,7 +699,7 @@ EOF
   echo
   echo "✅ 之后如果要切换："
   echo "  - 菜单 8 管理端口分流（同时 A:端口 → B:端口 转发）。"
-  echo "  - 菜单 9 切换【全局模式】 / 【端口分流模式】。"
+  echo "  - 菜单 9 切换【全局模式】 / 【端口分流模式】（全局模式 = 全端口 1:1）。"
 }
 
 manage_entry_ports() {
@@ -673,8 +717,8 @@ manage_entry_ports() {
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流"
-    echo "3) 删除分流列表端口"
+    echo "2) 添加端口到分流 + A→B 转发"
+    echo "3) 从分流列表删除端口并移除 A→B 转发"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -823,7 +867,7 @@ while true; do
   echo "5) 停止 WG-Raw"
   echo "6) 重启 WG-Raw"
   echo "7) 卸载 WG-Raw"
-  echo "8) 管理入口端口分流 + A→B 端口映射"
+  echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "0) 退出"
   echo "=================================================================="
