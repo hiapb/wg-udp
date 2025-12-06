@@ -4,6 +4,7 @@ set -e
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
 MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
+EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"  # 记录出口在 WG 内网的 IP（不带掩码）
 
 # udp2raw 相关
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
@@ -296,7 +297,7 @@ EOF
 # ====================== 入口通用函数 ======================
 
 ensure_policy_routing_for_ports() {
-  if ! ip link show "${WG_IF}" &>/divnull; then
+  if ! ip link show "${WG_IF}" &>/dev/null; then
     return 0
   fi
   if ! ip rule show | grep -q "fwmark 0x1 lookup 100"; then
@@ -366,6 +367,78 @@ get_current_mode() {
 set_mode_flag() {
   local mode="$1"
   echo "$mode" > "$MODE_FILE"
+}
+
+# === 新增：入口 A 把指定端口转发到出口 B 的同端口（O→A→B 场景） ===
+
+enable_ip_forward_global() {
+  echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
+  sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+  echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+  sysctl -p >/dev/null 2>&1 || true
+}
+
+get_wan_if() {
+  local wan
+  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  echo "${wan:-eth0}"
+}
+
+add_forward_port_mapping() {
+  local port="$1"
+  local exit_ip
+  local wan_if
+
+  [[ -z "$port" ]] && return 0
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  if [[ -z "$exit_ip" ]]; then
+    echo "⚠ 未找到出口 WG 内网 IP (${EXIT_WG_IP_FILE})，跳过 A:${port} → B:${port} 的转发配置。"
+    return 0
+  fi
+
+  enable_ip_forward_global
+  wan_if=$(get_wan_if)
+
+  # 1) A:port → DNAT 到 B_wg_ip:port
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+
+  # 2) FORWARD: 外网 → wg0 方向放行这个端口的新连接+回程
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+  # 3) 出 wg0 时 SNAT/MASQUERADE（兜底）
+  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+
+  echo "✅ 已开启 A:${port} → B(${exit_ip}):${port} 的转发（经 ${WG_IF}）"
+}
+
+remove_forward_port_mapping() {
+  local port="$1"
+  local exit_ip
+  local wan_if
+
+  [[ -z "$port" ]] && return 0
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  [[ -z "$exit_ip" ]] && return 0
+  wan_if=$(get_wan_if)
+
+  # 尝试删除对应规则（用 -D + 完整匹配）
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+  echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
 
 enable_global_mode() {
@@ -484,6 +557,11 @@ configure_entry() {
   EXIT_WG_IP=${EXIT_WG_IP:-10.0.0.1/32}
 
   mkdir -p /etc/wireguard
+
+  # 记录出口的 WG 内网 IP（不带掩码，用于端口 1:1 转发）
+  EXIT_WG_IP_NO_MASK="${EXIT_WG_IP%%/*}"
+  echo "$EXIT_WG_IP_NO_MASK" > "$EXIT_WG_IP_FILE"
+
   SAVED_EXIT_IP=""
   if [[ -f /etc/wireguard/.exit_public_ip ]]; then
     SAVED_EXIT_IP=$(cat /etc/wireguard/.exit_public_ip 2>/dev/null || true)
@@ -576,7 +654,7 @@ EOF
 
   echo
   echo "✅ 之后如果要切换："
-  echo "  - 菜单 8 管理端口分流。"
+  echo "  - 菜单 8 管理端口分流（同时 A:端口 → B:端口 转发）。"
   echo "  - 菜单 9 切换【全局模式】 / 【端口分流模式】。"
 }
 
@@ -585,6 +663,7 @@ manage_entry_ports() {
   echo "说明："
   echo "  - 管的是【入口这台机器】本地源端口的分流规则；"
   echo "  - 源端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
+  echo "  - 同时：从外部打到入口 A:该端口的 TCP，会转发到出口 B 的 WG 内网 IP:同端口；"
   echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
 
@@ -594,8 +673,8 @@ manage_entry_ports() {
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流列表"
-    echo "3) 从分流列表删除端口"
+    echo "2) 添加端口到分流 + A→B 转发"
+    echo "3) 从分流列表删除端口并移除 A→B 转发"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -615,6 +694,7 @@ manage_entry_ports() {
           add_port_to_list "$new_port"
           ensure_policy_routing_for_ports
           apply_port_rules_from_file
+          add_forward_port_mapping "$new_port"
         else
           echo "端口不合法。"
         fi
@@ -624,6 +704,7 @@ manage_entry_ports() {
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
           remove_port_iptables_rules "$del_port"
+          remove_forward_port_mapping "$del_port"
         else
           echo "端口不合法。"
         fi
@@ -710,7 +791,7 @@ uninstall_wg() {
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
-            "$PORT_LIST_FILE" "$MODE_FILE" 2>/dev/null || true
+            "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
       rm -rf "$UDP2RAW_WORKDIR" 2>/dev/null || true
@@ -742,7 +823,7 @@ while true; do
   echo "5) 停止 WG-Raw"
   echo "6) 重启 WG-Raw"
   echo "7) 卸载 WG-Raw"
-  echo "8) 管理入口端口分流"
+  echo "8) 管理入口端口分流 + A→B 端口映射"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "0) 退出"
   echo "=================================================================="
