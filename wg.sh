@@ -2,11 +2,15 @@
 set -e
 
 WG_IF="wg0"
-PORT_LIST_FILE="/etc/wireguard/.wg_ports"      # 入口端口分流列表
-MODE_FILE="/etc/wireguard/.wg_mode"            # 入口当前模式：split / global
+PORT_LIST_FILE="/etc/wireguard/.wg_ports"
+MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
+
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
+UDP2RAW_SERVER_UNIT="/etc/systemd/system/udp2raw-wg0.service"
+UDP2RAW_CLIENT_UNIT="/etc/systemd/system/udp2raw-wg0-client.service"
 UDP2RAW_PORT_FILE="/etc/wireguard/.udp2raw_port"
-UDP2RAW_PASS_FILE="/etc/wireguard/.udp2raw_pass"
+UDP2RAW_PSK_FILE="/etc/wireguard/.udp2raw_psk"
+UDP2RAW_CLIENT_LOCAL_PORT_FILE="/etc/wireguard/.udp2raw_client_local_port"
 
 if [[ $EUID -ne 0 ]]; then
   echo "请用 root 运行这个脚本： sudo bash wg.sh"
@@ -15,7 +19,7 @@ fi
 
 install_wireguard() {
   echo "[*] 检查 WireGuard 及相关依赖..."
-  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables curl)
+  NEED_PKGS=(wireguard wireguard-tools iproute2 iptables curl tar)
   MISSING_PKGS=()
 
   for pkg in "${NEED_PKGS[@]}"; do
@@ -34,44 +38,39 @@ install_wireguard() {
 }
 
 install_udp2raw() {
-  if [[ -x "$UDP2RAW_BIN" ]]; then
-    echo "[*] 检测到 udp2raw 已存在：$UDP2RAW_BIN"
+  if command -v udp2raw >/dev/null 2>&1; then
+    echo "[*] 检测到 udp2raw 已存在：$(command -v udp2raw)"
     return
   fi
 
-  echo "[*] 未检测到 udp2raw，尝试自动安装..."
-  TMP_DIR=$(mktemp -d)
-  cd "$TMP_DIR"
-
-  URL="https://github.com/wangyu-/udp2raw/releases/latest/download/udp2raw_binaries.tar.gz"
-  echo "  - 下载: $URL"
-  if ! curl -L -o udp2raw_binaries.tar.gz "$URL"; then
-    echo "❌ 下载 udp2raw_binaries.tar.gz 失败，请手动下载并放到 /usr/local/bin/udp2raw 后重试。"
-    return
-  fi
-
-  tar xzf udp2raw_binaries.tar.gz || {
-    echo "❌ 解压 udp2raw_binaries.tar.gz 失败，请手动安装 udp2raw。"
-    return
-  }
-
-  UDP2RAW_CANDIDATE=$(find . -maxdepth 2 -type f -name "udp2raw_amd64*" | head -n1 || true)
-  if [[ -z "$UDP2RAW_CANDIDATE" ]]; then
-    UDP2RAW_CANDIDATE=$(find . -maxdepth 2 -type f -name "udp2raw*" | head -n1 || true)
-  fi
-
-  if [[ -z "$UDP2RAW_CANDIDATE" ]]; then
-    echo "❌ 没找到 udp2raw 可执行文件，请手动安装到 /usr/local/bin/udp2raw。"
-    return
-  fi
-
+  echo "[*] 尝试安装 udp2raw..."
   mkdir -p /usr/local/bin
-  cp "$UDP2RAW_CANDIDATE" "$UDP2RAW_BIN"
-  chmod +x "$UDP2RAW_BIN"
-  cd /
-  rm -rf "$TMP_DIR"
+  TMP_TGZ="/tmp/udp2raw_binaries.tar.gz"
+  TMP_DIR="/tmp/udp2raw_extract.$$"
 
-  echo "✅ udp2raw 已安装到 $UDP2RAW_BIN"
+  mkdir -p "$TMP_DIR"
+
+  # 目前官方 release: https://github.com/wangyu-/udp2raw/releases
+  # 使用 20230206.0 的二进制包
+  local URL="https://github.com/wangyu-/udp2raw/releases/download/20230206.0/udp2raw_binaries.tar.gz"
+  echo "  - 尝试下载: $URL"
+
+  if ! curl -L --fail "$URL" -o "$TMP_TGZ" 2>/dev/null; then
+    echo "❌ 下载 udp2raw_binaries.tar.gz 失败，请手动安装 udp2raw 到 $UDP2RAW_BIN"
+    exit 1
+  fi
+
+  tar -xzf "$TMP_TGZ" -C "$TMP_DIR"
+  if [ ! -f "$TMP_DIR/udp2raw_amd64" ]; then
+    echo "❌ 没找到 udp2raw_amd64，可手动解压 $TMP_TGZ 看看里面文件名，然后自行放到 $UDP2RAW_BIN"
+    exit 1
+  fi
+
+  mv "$TMP_DIR/udp2raw_amd64" "$UDP2RAW_BIN"
+  chmod +x "$UDP2RAW_BIN"
+  rm -rf "$TMP_TGZ" "$TMP_DIR"
+
+  echo "[*] udp2raw 安装完成：$UDP2RAW_BIN"
 }
 
 detect_public_ip() {
@@ -85,13 +84,9 @@ detect_public_ip() {
   return 1
 }
 
-gen_pass() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
-}
-
 # ====================== 出口服务器配置 ======================
 configure_exit() {
-  echo "==== 配置为【出口服务器】(WireGuard + udp2raw 服务端) ===="
+  echo "==== 配置为【出口服务器】（WireGuard + udp2raw 服务端） ===="
 
   install_wireguard
   install_udp2raw
@@ -113,25 +108,32 @@ configure_exit() {
   read -rp "出口服务器对外网卡名(默认 ${DEFAULT_IF:-eth0}): " OUT_IF
   OUT_IF=${OUT_IF:-${DEFAULT_IF:-eth0}}
 
-  read -rp "udp2raw 对外监听端口 (默认 4000): " U2R_PORT
-  U2R_PORT=${U2R_PORT:-4000}
-
-  if [[ -f "$UDP2RAW_PASS_FILE" ]]; then
-    OLD_PASS=$(cat "$UDP2RAW_PASS_FILE" 2>/dev/null || true)
-  else
-    OLD_PASS=""
+  # udp2raw 对外端口 & 密码
+  DEFAULT_UDP2RAW_PORT=4000
+  if [[ -f "$UDP2RAW_PORT_FILE" ]]; then
+    OLD_PORT=$(cat "$UDP2RAW_PORT_FILE" 2>/dev/null || echo "")
   fi
-  read -rp "udp2raw 密码 (留空自动生成，当前: ${OLD_PASS:-无}): " U2R_PASS
-  if [[ -z "$U2R_PASS" ]]; then
-    U2R_PASS=$(gen_pass)
-    echo "[*] 自动生成 udp2raw 密码: $U2R_PASS"
+  if [[ -n "$OLD_PORT" ]]; then
+    read -rp "udp2raw 对外监听端口 (默认 ${OLD_PORT}): " UDP2RAW_PORT
+    UDP2RAW_PORT=${UDP2RAW_PORT:-$OLD_PORT}
+  else
+    read -rp "udp2raw 对外监听端口 (默认 ${DEFAULT_UDP2RAW_PORT}): " UDP2RAW_PORT
+    UDP2RAW_PORT=${UDP2RAW_PORT:-$DEFAULT_UDP2RAW_PORT}
+  fi
+
+  if [[ -f "$UDP2RAW_PSK_FILE" ]]; then
+    OLD_PSK=$(cat "$UDP2RAW_PSK_FILE" 2>/dev/null || echo "")
+  fi
+  read -rp "udp2raw 连接密码（留空则自动生成随机密码）: " UDP2RAW_PSK
+  if [[ -z "$UDP2RAW_PSK" ]]; then
+    UDP2RAW_PSK=$(head -c 16 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 16)
   fi
 
   mkdir -p /etc/wireguard
-  echo "$U2R_PORT" > "$UDP2RAW_PORT_FILE"
-  echo "$U2R_PASS" > "$UDP2RAW_PASS_FILE"
-
   cd /etc/wireguard
+
+  echo "$UDP2RAW_PORT" > "$UDP2RAW_PORT_FILE"
+  echo "$UDP2RAW_PSK" > "$UDP2RAW_PSK_FILE"
 
   if [ ! -f exit_private.key ]; then
     echo "[*] 生成出口服务器密钥..."
@@ -146,15 +148,19 @@ configure_exit() {
   echo "====== 出口服务器 公钥（发给入口服务器用）======"
   echo "${EXIT_PUBLIC_KEY}"
   echo "================================================"
-  echo "====== udp2raw 参数（入口需要一致） ======"
-  echo "端口: $U2R_PORT"
-  echo "密码: $U2R_PASS"
-  echo "==========================================="
+  echo
+  echo "====== udp2raw 连接信息（给入口服务器）======"
+  echo "  - 出口公网 IP:  ${PUB_IP_DETECTED:-你的出口服务器IP}"
+  echo "  - udp2raw 端口: ${UDP2RAW_PORT}"
+  echo "  - udp2raw 密码: ${UDP2RAW_PSK}"
+  echo "  - raw-mode:     faketcp"
+  echo "================================================"
   echo
 
-  read -rp "请输入【入口服务器公钥】(如果暂时没有可以直接回车占位): " ENTRY_PUBLIC_KEY
+  read -rp "请输入【入口服务器公钥】: " ENTRY_PUBLIC_KEY
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
+  # 开启 IPv4 转发
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   if ! grep -q "net.ipv4.ip_forward=1" /etc/sysctl.conf 2>/dev/null; then
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
@@ -180,14 +186,16 @@ EOF
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
 
-  cat > /etc/systemd/system/udp2raw-wg0.service <<EOF
+  # udp2raw 服务端
+  cat > "$UDP2RAW_SERVER_UNIT" <<EOF
 [Unit]
-Description=udp2raw for WireGuard wg0 (server)
-After=network-online.target wg-quick@wg0.service
+Description=udp2raw server for WireGuard (${WG_IF})
+After=network-online.target wg-quick@${WG_IF}.service
 Wants=network-online.target
 
 [Service]
-ExecStart=${UDP2RAW_BIN} -s -l0.0.0.0:${U2R_PORT} -r127.0.0.1:51820 -k "${U2R_PASS}" --raw-mode faketcp --cipher-mode xor --auth-mode simple
+Type=simple
+ExecStart=${UDP2RAW_BIN} -s -l0.0.0.0:${UDP2RAW_PORT} -r127.0.0.1:51820 --raw-mode faketcp -a -k ${UDP2RAW_PSK}
 Restart=always
 RestartSec=3
 
@@ -200,9 +208,9 @@ EOF
   systemctl restart udp2raw-wg0.service || true
 
   echo
-  echo "出口服务器配置完成：WireGuard + udp2raw (服务端)。"
-  echo "当前 wg 状态："
+  echo "出口服务器配置完成，当前状态："
   wg show || true
+  systemctl status udp2raw-wg0.service --no-pager -n 3 || true
 }
 
 # ====================== 入口服务器：通用函数 ======================
@@ -219,19 +227,25 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
-clear_mangle_output() {
-  iptables -t mangle -F OUTPUT 2>/dev/null || true
+# 清掉 OUTPUT 里所有 MARK 相关规则（不管是全局还是端口）
+clear_mark_rules() {
+  iptables -t mangle -S OUTPUT 2>/dev/null | grep " MARK " \
+    | sed 's/^-A /-D /' | while read -r line; do
+        iptables -t mangle $line 2>/dev/null || true
+      done
 }
 
 apply_port_rules_from_file() {
-  clear_mangle_output
+  clear_mark_rules
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
 
   while read -r p; do
     [[ -z "$p" ]] && continue
     [[ "$p" =~ ^# ]] && continue
-    iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
-    iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
   done < "$PORT_LIST_FILE"
 }
 
@@ -258,6 +272,12 @@ remove_port_from_list() {
   echo "已从分流列表中删除端口 $port。"
 }
 
+remove_port_iptables_rules() {
+  local port="$1"
+  iptables -t mangle -D OUTPUT -p tcp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+}
+
 get_current_mode() {
   if [[ -f "$MODE_FILE" ]]; then
     mode=$(cat "$MODE_FILE" 2>/dev/null || echo "split")
@@ -275,26 +295,61 @@ set_mode_flag() {
 enable_global_mode() {
   echo "[*] 切换为【全局模式】..."
   ensure_policy_routing_for_ports
-  clear_mangle_output
+  clear_mark_rules
 
-  iptables -t mangle -A OUTPUT -o lo -j RETURN
-  iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
-  iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
-  iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
-  iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
-  iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
-  iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
+  # 读取 udp2raw 本地监听端口（避免给 udp2raw 本身打 mark）
+  local UDP2RAW_LOCAL_PORT=""
+  if [[ -f "$UDP2RAW_CLIENT_LOCAL_PORT_FILE" ]]; then
+    UDP2RAW_LOCAL_PORT=$(cat "$UDP2RAW_CLIENT_LOCAL_PORT_FILE" 2>/dev/null || echo "")
+  fi
+
+  # 不处理 lo
+  iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -o lo -j RETURN
+
+  # 保证 DNS 不被标记（防止 wg/udp2raw 挂掉时 DNS 也跟着死）
+  iptables -t mangle -C OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
+  iptables -t mangle -C OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
+
+  # 保证 SSH 不被标记（源端口 22）
+  iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
+
+  # 保证 WireGuard 自身不被标记（UDP 51820）
+  iptables -t mangle -C OUTPUT -p udp --sport 51820 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
+  iptables -t mangle -C OUTPUT -p udp --dport 51820 -j RETURN 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
+
+  # 保证 udp2raw 本地口不被标记（不然会递归死）
+  if [[ -n "$UDP2RAW_LOCAL_PORT" ]]; then
+    iptables -t mangle -C OUTPUT -p udp --sport "$UDP2RAW_LOCAL_PORT" -j RETURN 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --sport "$UDP2RAW_LOCAL_PORT" -j RETURN
+    iptables -t mangle -C OUTPUT -p udp --dport "$UDP2RAW_LOCAL_PORT" -j RETURN 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --dport "$UDP2RAW_LOCAL_PORT" -j RETURN
+    iptables -t mangle -C OUTPUT -p tcp --sport "$UDP2RAW_LOCAL_PORT" -j RETURN 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --sport "$UDP2RAW_LOCAL_PORT" -j RETURN
+    iptables -t mangle -C OUTPUT -p tcp --dport "$UDP2RAW_LOCAL_PORT" -j RETURN 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --dport "$UDP2RAW_LOCAL_PORT" -j RETURN
+  fi
+
+  # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
+  iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
+    iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，除 SSH/WG/lo/DNS 外全部流量走出口。"
+  echo "✅ 已切到【全局模式】，全部流量默认通过出口（SSH/DNS/udp2raw 自身除外）。"
 }
 
 enable_split_mode() {
   echo "[*] 切换为【端口分流模式】..."
   ensure_policy_routing_for_ports
+  clear_mark_rules
   apply_port_rules_from_file
   set_mode_flag "split"
-  echo "✅ 已切回【端口分流模式】，只有分流端口走出口，其它走入口本机。"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
 }
 
 apply_current_mode() {
@@ -314,8 +369,8 @@ manage_entry_mode() {
     mode=$(get_current_mode)
     echo
     echo "当前模式：$mode"
-    echo "1) 切换为【全局模式】（除 SSH/WG/lo/DNS 外全部走出口）"
-    echo "2) 切换为【端口分流模式】（只列表端口走出口）"
+    echo "1) 切换为【全局模式】"
+    echo "2) 切换为【端口分流模式】"
     echo "3) 仅查看当前模式"
     echo "0) 返回主菜单"
     read -rp "请选择: " sub
@@ -329,10 +384,10 @@ manage_entry_mode() {
   done
 }
 
-# ====================== 入口服务器配置（WireGuard + udp2raw 客户端） ======================
+# ====================== 入口服务器配置（只配一次 + udp2raw） ======================
 
 configure_entry() {
-  echo "==== 配置为【入口服务器】(WireGuard + udp2raw 客户端) ===="
+  echo "==== 配置为【入口服务器】（WireGuard + udp2raw 客户端） ===="
 
   install_wireguard
   install_udp2raw
@@ -362,34 +417,32 @@ configure_entry() {
   fi
   echo "$EXIT_PUBLIC_IP" > /etc/wireguard/.exit_public_ip
 
-  DEFAULT_U2R_PORT="4000"
-  if [[ -f "$UDP2RAW_PORT_FILE" ]]; then
-    DEFAULT_U2R_PORT=$(cat "$UDP2RAW_PORT_FILE" 2>/dev/null || echo "4000")
-  fi
-  read -rp "udp2raw 远端端口 (与出口一致，默认 ${DEFAULT_U2R_PORT}): " U2R_PORT
-  U2R_PORT=${U2R_PORT:-$DEFAULT_U2R_PORT}
-
-  DEFAULT_U2R_PASS=""
-  if [[ -f "$UDP2RAW_PASS_FILE" ]]; then
-    DEFAULT_U2R_PASS=$(cat "$UDP2RAW_PASS_FILE" 2>/dev/null || echo "")
-  fi
-  read -rp "udp2raw 密码 (与出口一致，当前默认: ${DEFAULT_U2R_PASS:-空}): " U2R_PASS
-  U2R_PASS=${U2R_PASS:-$DEFAULT_U2R_PASS}
-
-  if [[ -z "$U2R_PASS" ]]; then
-    echo "❌ 必须提供与出口一致的 udp2raw 密码。"
+  # udp2raw 服务器端口 & 密码（从出口那边获得）
+  read -rp "出口服务器 udp2raw 端口（和出口上配置的一致，例如 4000）: " UDP2RAW_PORT
+  if [[ -z "$UDP2RAW_PORT" ]]; then
+    echo "udp2raw 端口不能为空。"
     exit 1
   fi
 
-  read -rp "入口本地 udp2raw 监听端口 (默认 4000): " LOCAL_U2R_PORT
-  LOCAL_U2R_PORT=${LOCAL_U2R_PORT:-4000}
-
-  # ★★★ 新增：让你直接填出口公钥 ★★★
-  read -rp "请输入【出口服务器公钥】(必填): " EXIT_PUBLIC_KEY
-  if [[ -z "$EXIT_PUBLIC_KEY" ]]; then
-    echo "❌ 出口服务器公钥不能为空。"
+  read -rp "udp2raw 密码（和出口上显示的一致）: " UDP2RAW_PSK
+  if [[ -z "$UDP2RAW_PSK" ]]; then
+    echo "udp2raw 密码不能为空。"
     exit 1
   fi
+
+  # 本地 udp2raw 监听端口（给 WG 用）
+  DEFAULT_LOCAL_PORT=51821
+  if [[ -f "$UDP2RAW_CLIENT_LOCAL_PORT_FILE" ]]; then
+    OLD_LOCAL=$(cat "$UDP2RAW_CLIENT_LOCAL_PORT_FILE" 2>/dev/null || echo "")
+  fi
+  if [[ -n "$OLD_LOCAL" ]]; then
+    read -rp "本机 udp2raw 本地监听端口 (默认 ${OLD_LOCAL}): " UDP2RAW_LOCAL_PORT
+    UDP2RAW_LOCAL_PORT=${UDP2RAW_LOCAL_PORT:-$OLD_LOCAL}
+  else
+    read -rp "本机 udp2raw 本地监听端口 (默认 ${DEFAULT_LOCAL_PORT}): " UDP2RAW_LOCAL_PORT
+    UDP2RAW_LOCAL_PORT=${UDP2RAW_LOCAL_PORT:-$DEFAULT_LOCAL_PORT}
+  fi
+  echo "$UDP2RAW_LOCAL_PORT" > "$UDP2RAW_CLIENT_LOCAL_PORT_FILE"
 
   cd /etc/wireguard
 
@@ -403,16 +456,13 @@ configure_entry() {
   ENTRY_PUBLIC_KEY=$(cat entry_public.key)
 
   echo
-  echo "====== 入口服务器 公钥（发给出口服务器用）======"
+  echo "====== 入口服务器 公钥（发给出口服务器）======"
   echo "${ENTRY_PUBLIC_KEY}"
   echo "================================================"
-  echo "udp2raw 参数（已经在出口那边配置好）："
-  echo "  远端 IP   : ${EXIT_PUBLIC_IP}"
-  echo "  远端端口 : ${U2R_PORT}"
-  echo "  密码     : ${U2R_PASS}"
-  echo "  本地端口 : ${LOCAL_U2R_PORT} (wg Endpoint 会连 127.0.0.1:${LOCAL_U2R_PORT})"
-  echo "================================================"
   echo
+
+  read -rp "请输入【出口服务器公钥】（出口脚本运行时给你的那个）: " EXIT_PUBLIC_KEY
+  EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
 
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
@@ -420,35 +470,28 @@ Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
 
-PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100
-PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true
+PostUp   = ip rule show | grep -q "fwmark 0x1 lookup 100" || ip rule add fwmark 0x1 lookup 100; ip route replace default dev ${WG_IF} table 100; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE
+PostDown = ip rule del fwmark 0x1 lookup 100 2>/dev/null || true; ip route flush table 100 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
 
 [Peer]
 PublicKey = ${EXIT_PUBLIC_KEY}
-Endpoint = 127.0.0.1:${LOCAL_U2R_PORT}
+Endpoint = 127.0.0.1:${UDP2RAW_LOCAL_PORT}
 AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
   chmod 600 /etc/wireguard/${WG_IF}.conf
 
-  systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
-  wg-quick down ${WG_IF} 2>/dev/null || true
-  wg-quick up ${WG_IF}
-
-  ensure_policy_routing_for_ports
-
-  set_mode_flag "split"
-  apply_current_mode
-
-  cat > /etc/systemd/system/udp2raw-wg0.service <<EOF
+  # udp2raw 客户端
+  cat > "$UDP2RAW_CLIENT_UNIT" <<EOF
 [Unit]
-Description=udp2raw for WireGuard wg0 (client)
+Description=udp2raw client for WireGuard (${WG_IF})
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=${UDP2RAW_BIN} -c -l127.0.0.1:${LOCAL_U2R_PORT} -r${EXIT_PUBLIC_IP}:${U2R_PORT} -k "${U2R_PASS}" --raw-mode faketcp --cipher-mode xor --auth-mode simple
+Type=simple
+ExecStart=${UDP2RAW_BIN} -c -r${EXIT_PUBLIC_IP}:${UDP2RAW_PORT} -l127.0.0.1:${UDP2RAW_LOCAL_PORT} --raw-mode faketcp -a -k ${UDP2RAW_PSK}
 Restart=always
 RestartSec=3
 
@@ -457,18 +500,28 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable udp2raw-wg0.service >/dev/null 2>&1 || true
-  systemctl restart udp2raw-wg0.service || true
+  systemctl enable udp2raw-wg0-client.service >/dev/null 2>&1 || true
+  systemctl restart udp2raw-wg0-client.service || true
+
+  systemctl enable wg-quick@${WG_IF}.service >/dev/null 2>&1 || true
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  wg-quick up ${WG_IF}
+
+  ensure_policy_routing_for_ports
+
+  # 默认先用端口分流模式
+  set_mode_flag "split"
+  apply_current_mode
 
   echo
-  echo "入口服务器配置完成：WireGuard + udp2raw (客户端)。"
-  echo "当前 wg 状态："
+  echo "入口服务器配置完成，当前状态："
   wg show || true
+  systemctl status udp2raw-wg0-client.service --no-pager -n 3 || true
 
   echo
   echo "✅ 之后如果要切换："
-  echo "  - 用本脚本菜单 8 管理端口分流（添加/删除入口本地源端口）。"
-  echo "  - 用本脚本菜单 9 在【全局模式】 / 【端口分流模式】之间切换。"
+  echo "  - 用本脚本菜单 8 管理端口分流。"
+  echo "  - 用本脚本菜单 9 切换【全局模式】 / 【端口分流模式】。"
 }
 
 manage_entry_ports() {
@@ -485,8 +538,8 @@ manage_entry_ports() {
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流列表（立即生效）"
-    echo "3) 从分流列表删除端口（立即生效）"
+    echo "2) 添加端口到分流列表"
+    echo "3) 从分流列表删除端口"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
@@ -514,7 +567,7 @@ manage_entry_ports() {
         read -rp "请输入要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
-          apply_port_rules_from_file
+          remove_port_iptables_rules "$del_port"
         else
           echo "端口不合法。"
         fi
@@ -539,60 +592,68 @@ show_status() {
   fi
 
   echo
-  echo "==== udp2raw 服务状态 ===="
-  systemctl status udp2raw-wg0.service 2>/dev/null | sed -n '1,10p' || echo "udp2raw-wg0.service 未配置或未运行。"
+  echo "==== udp2raw 服务状态（如存在） ===="
+  systemctl status udp2raw-wg0.service --no-pager -n 2 2>/dev/null || echo "udp2raw-wg0.service 未配置/未运行。"
+  systemctl status udp2raw-wg0-client.service --no-pager -n 2 2>/dev/null || echo "udp2raw-wg0-client.service 未配置/未运行。"
 }
 
 start_wg() {
   echo "[*] 启动 WireGuard (${WG_IF})..."
-  wg-quick up ${WG_IF} || true
+  wg-quick up ${WG_IF} 2>/dev/null || true
   ensure_policy_routing_for_ports
   apply_current_mode
-  systemctl restart udp2raw-wg0.service 2>/dev/null || true
+  systemctl start udp2raw-wg0.service 2>/dev/null || true
+  systemctl start udp2raw-wg0-client.service 2>/dev/null || true
   wg show || true
 }
 
 stop_wg() {
-  echo "[*] 停止 WireGuard (${WG_IF}) 和 udp2raw..."
+  echo "[*] 停止 WireGuard (${WG_IF})..."
+  wg-quick down ${WG_IF} 2>/dev/null || true
   systemctl stop udp2raw-wg0.service 2>/dev/null || true
-  wg-quick down ${WG_IF} || true
+  systemctl stop udp2raw-wg0-client.service 2>/dev/null || true
   wg show || true
 }
 
 restart_wg() {
-  echo "[*] 重启 WireGuard (${WG_IF}) 和 udp2raw..."
-  systemctl stop udp2raw-wg0.service 2>/dev/null || true
+  echo "[*] 重启 WireGuard (${WG_IF})..."
   wg-quick down ${WG_IF} 2>/dev/null || true
-  wg-quick up ${WG_IF} || true
+  wg-quick up ${WG_IF} 2>/dev/null || true
   ensure_policy_routing_for_ports
   apply_current_mode
   systemctl restart udp2raw-wg0.service 2>/dev/null || true
+  systemctl restart udp2raw-wg0-client.service 2>/dev/null || true
   wg show || true
 }
 
 uninstall_wg() {
   echo "==== 卸载 WireGuard + udp2raw ===="
   echo "此操作将会："
-  echo "  - 停止 wg-quick@${WG_IF} 和 udp2raw-wg0 服务，并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
-  echo "  - 移除策略路由 / iptables 标记规则 / table 100"
-  echo "  - 卸载 wireguard 与 wireguard-tools（保留 iptables/iproute2）"
-  echo "  - 删除 udp2raw-wg0.service 单元文件"
+  echo "  - 停止 wg-quick@${WG_IF}、udp2raw 服务并取消开机自启"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置、udp2raw 配置"
+  echo "  - 移除策略路由 / iptables 标记 / NAT 规则"
+  echo "  - 卸载 wireguard 与 wireguard-tools（保留 iptables、iproute2、curl）"
   echo "  - 删除当前脚本文件：$0"
   echo
   read -rp "确认卸载并删除脚本？(y/N): " confirm
   case "$confirm" in
     y|Y)
-      systemctl stop udp2raw-wg0.service 2>/dev/null || true
-      systemctl disable udp2raw-wg0.service 2>/dev/null || true
       systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
       wg-quick down ${WG_IF} 2>/dev/null || true
 
+      systemctl stop udp2raw-wg0.service 2>/dev/null || true
+      systemctl disable udp2raw-wg0.service 2>/dev/null || true
+      systemctl stop udp2raw-wg0-client.service 2>/dev/null || true
+      systemctl disable udp2raw-wg0-client.service 2>/dev/null || true
+
+      rm -f "$UDP2RAW_SERVER_UNIT" "$UDP2RAW_CLIENT_UNIT" 2>/dev/null || true
+      systemctl daemon-reload
+
       ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
       ip route flush table 100 2>/dev/null || true
 
-      clear_mangle_output
+      clear_mark_rules
       iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
 
       rm -f /etc/wireguard/${WG_IF}.conf \
@@ -600,17 +661,14 @@ uninstall_wg() {
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
             "$PORT_LIST_FILE" "$MODE_FILE" \
-            "$UDP2RAW_PORT_FILE" "$UDP2RAW_PASS_FILE" 2>/dev/null || true
+            "$UDP2RAW_PORT_FILE" "$UDP2RAW_PSK_FILE" "$UDP2RAW_CLIENT_LOCAL_PORT_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
-
-      rm -f /etc/systemd/system/udp2raw-wg0.service 2>/dev/null || true
-      systemctl daemon-reload
 
       export DEBIAN_FRONTEND=noninteractive
       apt remove -y wireguard wireguard-tools 2>/dev/null || true
       apt autoremove -y 2>/dev/null || true
 
-      echo "✅ WireGuard + udp2raw 已卸载，配置和分流规则已清理。"
+      echo "✅ WireGuard & udp2raw 已卸载，配置和端口分流规则已清理。"
       echo "✅ 正在删除当前脚本：$0"
       rm -f "$0" 2>/dev/null || true
       echo "✅ 脚本已删除，退出。"
@@ -626,18 +684,18 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ WireGuard + udp2raw 一键脚本 ================"
-  echo "1) 配置为 出口服务器 (WG + udp2raw 服务端)"
-  echo "2) 配置为 入口服务器"
+  echo "================ WireGuard 一键脚本（内置 udp2raw） ================"
+  echo "1) 配置为 出口服务器（WireGuard + udp2raw 服务端）"
+  echo "2) 配置为 入口服务器（WireGuard + udp2raw 客户端）"
   echo "3) 查看 WireGuard / udp2raw 状态"
   echo "4) 启动 WireGuard + udp2raw"
   echo "5) 停止 WireGuard + udp2raw"
   echo "6) 重启 WireGuard + udp2raw"
-  echo "7) 卸载 WireGuard + udp2raw"
-  echo "8) 管理入口端口分流（添加/查看/删除）"
+  echo "7) 卸载 WireGuard + udp2raw（并删除脚本）"
+  echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 端口分流）"
   echo "0) 退出"
-  echo "===================================================="
+  echo "==================================================================="
   read -rp "请选择: " choice
 
   case "$choice" in
