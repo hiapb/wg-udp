@@ -12,7 +12,7 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-# ====================== udp2raw 安装（只安装，不自动启用） ======================
+# ====================== udp2raw 安装 ======================
 install_udp2raw() {
   if command -v udp2raw >/dev/null 2>&1; then
     echo "[*] udp2raw 已安装：$(command -v udp2raw)"
@@ -23,7 +23,6 @@ install_udp2raw() {
   TMPDIR=$(mktemp -d)
   cd "$TMPDIR" || exit 1
 
-  # 官方 20230206.0 版本二进制包
   UDP2RAW_URL="https://github.com/wangyu-/udp2raw/releases/download/20230206.0/udp2raw_binaries.tar.gz"
 
   echo "[*] 下载：$UDP2RAW_URL"
@@ -70,7 +69,6 @@ install_wireguard() {
     apt install -y "${MISSING_PKGS[@]}"
   fi
 
-  # 顺便安装 udp2raw（只是准备好）
   install_udp2raw
 }
 
@@ -112,7 +110,6 @@ configure_exit() {
   read -rp "udp2raw 服务器监听端口 (默认 4000): " UDP2RAW_PORT
   UDP2RAW_PORT=${UDP2RAW_PORT:-4000}
 
-  # 密码尽量简单点（不含空格和引号）
   DEFAULT_PASS=$(tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16)
   read -rp "udp2raw 密码 (默认随机: ${DEFAULT_PASS}，不要包含空格和引号): " UDP2RAW_PASS
   UDP2RAW_PASS=${UDP2RAW_PASS:-$DEFAULT_PASS}
@@ -148,13 +145,11 @@ configure_exit() {
     echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   fi
 
-  # 保存 udp2raw 出口配置
   cat > "$UDP2RAW_EXIT_CONF" <<EOF
 PORT=${UDP2RAW_PORT}
 PASS=${UDP2RAW_PASS}
 EOF
 
-  # WireGuard 监听本机 UDP 51820，由 udp2raw 转发过来
   WG_PORT=51820
 
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
@@ -177,7 +172,6 @@ EOF
   wg-quick down ${WG_IF} 2>/dev/null || true
   wg-quick up ${WG_IF}
 
-  # 创建 udp2raw server systemd 服务
   if command -v udp2raw >/dev/null 2>&1; then
     cat > /etc/systemd/system/udp2raw-wg-exit.service <<EOF
 [Unit]
@@ -214,8 +208,7 @@ EOF
   wg show || true
 }
 
-# ====================== 入口服务器：策略路由 & 分流 ======================
-
+# ====================== 入口：策略路由 & 分流 ======================
 ensure_policy_routing_for_ports() {
   if ! ip link show "${WG_IF}" &>/dev/null; then
     return 0
@@ -228,7 +221,6 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
-# 清理 OUTPUT 链中所有 MARK 相关规则，避免模式切换后残留
 clear_mark_rules() {
   iptables -t mangle -S OUTPUT 2>/dev/null | grep " MARK " \
     | sed 's/^-A /-D /' | while read -r line; do
@@ -298,25 +290,21 @@ enable_global_mode() {
   ensure_policy_routing_for_ports
   clear_mark_rules
 
-  # 不处理 lo
   iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -o lo -j RETURN
 
-  # SSH 不走 wg（避免断连）
   iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
 
-  # WireGuard 隧道本身不走 wg（避免递归）
   iptables -t mangle -C OUTPUT -p udp --sport 51820 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --sport 51820 -j RETURN
   iptables -t mangle -C OUTPUT -p udp --dport 51820 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --dport 51820 -j RETURN
 
-  # 其余所有出站流量打 mark=0x1 → table100 → wg0
   iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
 
-  set_mode_flag("global") 2>/dev/null || set_mode_flag global
+  set_mode_flag global
   echo "✅ 已切到【全局模式】，除 SSH/WG/lo 外全部流量走出口。"
 }
 
@@ -325,7 +313,7 @@ enable_split_mode() {
   ensure_policy_routing_for_ports
   clear_mark_rules
   apply_port_rules_from_file
-  set_mode_flag("split") 2>/dev/null || set_mode_flag split
+  set_mode_flag split
   echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
 }
 
@@ -361,7 +349,7 @@ manage_entry_mode() {
   done
 }
 
-# ====================== 入口服务器配置（WG + udp2raw client） ======================
+# ====================== 入口：WG + udp2raw client ======================
 configure_entry() {
   echo "==== 配置为【入口服务器】 ===="
 
@@ -392,7 +380,6 @@ configure_entry() {
   fi
   echo "$EXIT_PUBLIC_IP" > /etc/wireguard/.exit_public_ip
 
-  # udp2raw client 相关
   read -rp "出口 udp2raw 服务器端口 (默认 4000): " UDP2RAW_PORT
   UDP2RAW_PORT=${UDP2RAW_PORT:-4000}
 
@@ -431,7 +418,6 @@ configure_entry() {
   read -rp "请输入【出口服务器公钥】: " EXIT_PUBLIC_KEY
   EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
 
-  # 保存入口 udp2raw 配置
   cat > "$UDP2RAW_ENTRY_CONF" <<EOF
 EXIT_IP=${EXIT_PUBLIC_IP}
 SERVER_PORT=${UDP2RAW_PORT}
@@ -439,7 +425,6 @@ LOCAL_PORT=${UDP2RAW_LOCAL}
 PASS=${UDP2RAW_PASS}
 EOF
 
-  # WG 对 udp2raw 本地监听端口发包，而不是直接对出口公网发包
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
 Address = ${WG_ADDR}
@@ -468,7 +453,6 @@ EOF
 
   ensure_policy_routing_for_ports
 
-  # 创建 udp2raw client systemd 服务
   if command -v udp2raw >/dev/null 2>&1; then
     cat > /etc/systemd/system/udp2raw-wg-entry.service <<EOF
 [Unit]
@@ -500,8 +484,7 @@ EOF
     echo "⚠ udp2raw 未安装成功，入口暂时只能直接连 WG（不走 udp2raw）。"
   fi
 
-  # 默认先用端口分流模式
-  set_mode_flag "split"
+  set_mode_flag split
   apply_current_mode
 
   echo
