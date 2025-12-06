@@ -3,8 +3,8 @@ set -e
 
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
-MODE_FILE="/etc/wireguard/.wg_mode"   # 记录入口当前模式：split / global
-EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"  # 记录出口在 WG 内网的 IP（不带掩码）
+MODE_FILE="/etc/wireguard/.wg_mode" 
+EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip" 
 
 # udp2raw 相关
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
@@ -384,7 +384,6 @@ get_wan_if() {
   echo "${wan:-eth0}"
 }
 
-# === 新增：入口 A 把“指定端口”转发到出口 B 的同端口（用于分流模式下的 O→A→B） ===
 
 add_forward_port_mapping() {
   local port="$1"
@@ -551,7 +550,7 @@ enable_split_mode() {
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   set_mode_flag "split"
-  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口（外部只转发已添加端口）。"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
 }
 
 apply_current_mode() {
@@ -698,8 +697,8 @@ EOF
 
   echo
   echo "✅ 之后如果要切换："
-  echo "  - 菜单 8 管理端口分流（同时 A:端口 → B:端口 转发）。"
-  echo "  - 菜单 9 切换【全局模式】 / 【端口分流模式】（全局模式 = 全端口 1:1）。"
+  echo "  - 菜单 8 管理端口分流"
+  echo "  - 菜单 9 切换【全局模式】 / 【端口分流模式】"
 }
 
 manage_entry_ports() {
@@ -717,8 +716,8 @@ manage_entry_ports() {
     echo
     echo "---- 端口管理菜单 ----"
     echo "1) 查看当前分流端口列表"
-    echo "2) 添加端口到分流 + A→B 转发"
-    echo "3) 从分流列表删除端口并移除 A→B 转发"
+    echo "2) 添加端口到分流"
+    echo "3) 删除分流列表端口"
     echo "0) 返回主菜单"
     echo "----------------------"
     read -rp "请选择: " sub
