@@ -3,8 +3,17 @@ set -e
 
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
-MODE_FILE="/etc/wireguard/.wg_mode" 
-EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip" 
+MODE_FILE="/etc/wireguard/.wg_mode"
+EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"
+ROLE_FILE="/etc/wireguard/.wg_role"              # entry / exit
+
+# 出口多入口相关
+EXIT_IFACE_FILE="/etc/wireguard/${WG_IF}.interface"  # 只保存 [Interface]
+EXIT_PEERS_DB="/etc/wireguard/${WG_IF}.peers"        # name|pubkey|allowed_ips|enabled(1/0)
+
+# 对端公钥记忆文件（简易记一次最近用的）
+ENTRY_PEER_PUB_FILE="/etc/wireguard/.entry_peer_pub"  # 出口机上，记录入口的公钥（最近一次）
+EXIT_PEER_PUB_FILE="/etc/wireguard/.exit_peer_pub"    # 入口机上，记录出口的公钥（最近一次）
 
 # udp2raw 相关
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
@@ -17,13 +26,21 @@ UDP2RAW_REMOTE_FILE="${UDP2RAW_WORKDIR}/remote"
 # 统一安全 MTU
 WG_SAFE_MTU=1320
 
-# 不常见的默认 udp2raw 端口
+# 默认 udp2raw 端口
 UDP2RAW_DEFAULT_PORT=40008
 
 if [[ $EUID -ne 0 ]]; then
-  echo "请用 root 运行这个脚本： sudo bash wg.sh"
+  echo "请用 root 运行这个脚本： sudo bash $0"
   exit 1
 fi
+
+get_role() {
+  if [[ -f "$ROLE_FILE" ]]; then
+    cat "$ROLE_FILE"
+  else
+    echo "unknown"
+  fi
+}
 
 install_wireguard() {
   echo "[*] 检查 WireGuard 及相关依赖..."
@@ -177,6 +194,31 @@ detect_public_ip() {
   return 1
 }
 
+# ====================== 出口服务器：重建 wg0.conf（多入口） ======================
+rebuild_exit_wg_conf() {
+  if [[ ! -f "$EXIT_IFACE_FILE" ]]; then
+    echo "⚠ 出口 Interface 配置不存在：$EXIT_IFACE_FILE"
+    return 1
+  fi
+
+  local conf="/etc/wireguard/${WG_IF}.conf"
+  cp "$EXIT_IFACE_FILE" "$conf"
+
+  if [[ -f "$EXIT_PEERS_DB" ]]; then
+    while IFS='|' read -r name pkey aips enabled; do
+      [[ -z "$pkey" ]] && continue
+      [[ "$enabled" != "1" ]] && continue
+      cat >>"$conf" <<EOF
+
+[Peer]
+# Name: ${name}
+PublicKey = ${pkey}
+AllowedIPs = ${aips}
+EOF
+    done < "$EXIT_PEERS_DB"
+  fi
+}
+
 # ====================== 出口服务器配置 ======================
 configure_exit() {
   echo "==== 配置为【出口服务器】 ===="
@@ -186,28 +228,52 @@ configure_exit() {
 
   PUB_IP_DETECTED=$(detect_public_ip || true)
   if [[ -n "$PUB_IP_DETECTED" ]]; then
-    echo "[*] 检测到出口服务器公网 IP：$PUB_IP_DETECTED"
+    echo "[*] 检测到出口服务器公网 IP 可能是：$PUB_IP_DETECTED"
+    read -rp "出口服务器公网 IP (默认 ${PUB_IP_DETECTED}): " EXIT_PUBLIC_IP
+    EXIT_PUBLIC_IP=${EXIT_PUBLIC_IP:-$PUB_IP_DETECTED}
   else
     echo "[*] 未能自动检测公网 IP，请查看服务商面板。"
+    read -rp "出口服务器公网 IP: " EXIT_PUBLIC_IP
   fi
+  echo "[*] 将该 IP 作为出口公网 IP：${EXIT_PUBLIC_IP}"
 
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.1/24}
 
-  read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/32): " ENTRY_WG_IP
-  ENTRY_WG_IP=${ENTRY_WG_IP:-10.0.0.2/32}
+  read -rp "第一个入口的 WireGuard 内网 IP (默认 10.0.0.2/32): " FIRST_ENTRY_WG_IP
+  FIRST_ENTRY_WG_IP=${FIRST_ENTRY_WG_IP:-10.0.0.2/32}
 
   DEFAULT_IF=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
   read -rp "出口服务器对外网卡名(默认 ${DEFAULT_IF:-ens3}): " OUT_IF
   OUT_IF=${OUT_IF:-${DEFAULT_IF:-ens3}}
 
   mkdir -p /etc/wireguard
+  echo "exit" > "$ROLE_FILE"
   cd /etc/wireguard
 
-  if [ ! -f exit_private.key ]; then
-    echo "[*] 生成出口服务器密钥..."
+  # ==== 出口本机私钥：可自填/用旧的/自动生成 ====
+  if [ -f exit_private.key ]; then
+    CUR_EXIT_PRIV=$(cat exit_private.key 2>/dev/null || true)
+    if [[ -n "$CUR_EXIT_PRIV" ]]; then
+      echo "[*] 当前已有出口服务器私钥："
+      echo "    $CUR_EXIT_PRIV"
+    fi
+  fi
+  read -rp "出口服务器私钥(留空则使用现有 / 自动生成): " INPUT_EXIT_PRIV
+
+  if [[ -n "$INPUT_EXIT_PRIV" ]]; then
+    echo "[*] 使用你输入的出口私钥。"
     umask 077
-    wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+    echo "$INPUT_EXIT_PRIV" > exit_private.key
+    echo "$INPUT_EXIT_PRIV" | wg pubkey > exit_public.key
+  else
+    if [ -f exit_private.key ]; then
+      echo "[*] 使用已有出口私钥文件。"
+    else
+      echo "[*] 未检测到已有私钥，自动生成出口服务器密钥..."
+      umask 077
+      wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+    fi
   fi
 
   EXIT_PRIVATE_KEY=$(cat exit_private.key)
@@ -219,17 +285,34 @@ configure_exit() {
   echo "================================================"
   echo
 
-  read -rp "请输入【入口服务器公钥】: " ENTRY_PUBLIC_KEY
-  ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
+  # ==== 第一个入口公钥：记住最近一次 ====
+  if [[ -f "$ENTRY_PEER_PUB_FILE" ]]; then
+    OLD_ENTRY_PUB=$(cat "$ENTRY_PEER_PUB_FILE" 2>/dev/null || true)
+    if [[ -n "$OLD_ENTRY_PUB" ]]; then
+      echo "[*] 检测到之前记录的入口服务器公钥："
+      echo "    $OLD_ENTRY_PUB"
+    fi
+  fi
+  read -rp "请输入【第一个入口服务器公钥】(留空则使用上面的 / 默认占位): " ENTRY_PUBLIC_KEY
 
-  # 选择 udp2raw 监听端口，禁止 89
+  if [[ -z "$ENTRY_PUBLIC_KEY" ]]; then
+    if [[ -n "$OLD_ENTRY_PUB" ]]; then
+      ENTRY_PUBLIC_KEY="$OLD_ENTRY_PUB"
+      echo "[*] 使用已有入口服务器公钥。"
+    else
+      ENTRY_PUBLIC_KEY="CHANGE_ME_ENTRY_PUBLIC_KEY"
+      echo "[*] 未提供入口公钥，先写入占位符：$ENTRY_PUBLIC_KEY"
+    fi
+  fi
+  echo "$ENTRY_PUBLIC_KEY" > "$ENTRY_PEER_PUB_FILE"
+
+  read -rp "给这个入口起个名字(默认 entry1): " FIRST_ENTRY_NAME
+  FIRST_ENTRY_NAME=${FIRST_ENTRY_NAME:-entry1}
+
+  # 选择 udp2raw 监听端口
   local UDP2RAW_PORT
   read -rp "udp2raw 出口服务端监听端口 (默认 ${UDP2RAW_DEFAULT_PORT}): " UDP2RAW_PORT
   UDP2RAW_PORT=${UDP2RAW_PORT:-$UDP2RAW_DEFAULT_PORT}
-  if [[ "$UDP2RAW_PORT" == "89" ]]; then
-    echo "❌ 端口 89 不允许作为出口 udp2raw 端口，请重新运行脚本并选择其他端口。"
-    return
-  fi
   if ! [[ "$UDP2RAW_PORT" =~ ^[0-9]+$ ]] || [ "$UDP2RAW_PORT" -lt 1 ] || [ "$UDP2RAW_PORT" -gt 65535 ]; then
     echo "❌ udp2raw 端口不合法，退出。"
     return
@@ -254,7 +337,8 @@ configure_exit() {
   iptables -t nat -C POSTROUTING -s 10.0.0.0/24 -o "${OUT_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o "${OUT_IF}" -j MASQUERADE
 
-  cat > /etc/wireguard/${WG_IF}.conf <<EOF
+  # 写 Interface 模板
+  cat > "$EXIT_IFACE_FILE" <<EOF
 [Interface]
 Address = ${WG_ADDR}
 ListenPort = 51820
@@ -263,11 +347,13 @@ MTU = ${WG_SAFE_MTU}
 
 PostUp   = iptables -A FORWARD -i ${WG_IF} -j ACCEPT; iptables -A FORWARD -o ${WG_IF} -j ACCEPT; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 PostDown = iptables -D FORWARD -i ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -o ${WG_IF} -j ACCEPT 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-
-[Peer]
-PublicKey = ${ENTRY_PUBLIC_KEY}
-AllowedIPs = ${ENTRY_WG_IP}
 EOF
+
+  # 写第一个入口到 peers 数据库（enabled=1）
+  echo "${FIRST_ENTRY_NAME}|${ENTRY_PUBLIC_KEY}|${FIRST_ENTRY_WG_IP}|1" > "$EXIT_PEERS_DB"
+
+  # 重建 wg0.conf（Interface + 所有启用的 Peer）
+  rebuild_exit_wg_conf
 
   chmod 600 /etc/wireguard/${WG_IF}.conf
 
@@ -282,7 +368,7 @@ EOF
 
   echo
   echo "====== udp2raw 连接信息（给入口服务器用）======"
-  echo "出口公网 IP：${PUB_IP_DETECTED:-<你的出口公网IP>}"
+  echo "出口公网 IP：${EXIT_PUBLIC_IP}"
   echo "udp2raw 监听端口：${UDP2RAW_PORT}"
   echo "PSK：${UDP2RAW_PSK}"
   echo "raw-mode：faketcp"
@@ -369,8 +455,6 @@ set_mode_flag() {
   echo "$mode" > "$MODE_FILE"
 }
 
-# === 新增：一些公共小工具 ===
-
 enable_ip_forward_global() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
@@ -383,7 +467,6 @@ get_wan_if() {
   wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
   echo "${wan:-eth0}"
 }
-
 
 add_forward_port_mapping() {
   local port="$1"
@@ -434,15 +517,12 @@ remove_forward_port_mapping() {
   [[ -z "$exit_ip" ]] && return 0
   wan_if=$(get_wan_if)
 
-  # 尝试删除对应规则（用 -D + 完整匹配）
   iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
   iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
   echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
-
-# === 新增：全局模式下的“全端口 1:1 转发 A→B” ===
 
 enable_full_port_forward_to_exit_all() {
   local exit_ip
@@ -600,6 +680,7 @@ configure_entry() {
   EXIT_WG_IP=${EXIT_WG_IP:-10.0.0.1/32}
 
   mkdir -p /etc/wireguard
+  echo "entry" > "$ROLE_FILE"
 
   # 记录出口的 WG 内网 IP（不带掩码，用于端口 1:1 转发）
   EXIT_WG_IP_NO_MASK="${EXIT_WG_IP%%/*}"
@@ -611,6 +692,7 @@ configure_entry() {
   fi
 
   if [[ -n "$SAVED_EXIT_IP" ]]; then
+    echo "[*] 已记录上次使用的出口公网 IP：$SAVED_EXIT_IP"
     read -rp "出口服务器公网 IP (默认 ${SAVED_EXIT_IP}): " EXIT_PUBLIC_IP
     EXIT_PUBLIC_IP=${EXIT_PUBLIC_IP:-$SAVED_EXIT_IP}
   else
@@ -624,10 +706,30 @@ configure_entry() {
   echo "$EXIT_PUBLIC_IP" > /etc/wireguard/.exit_public_ip
 
   cd /etc/wireguard
-  if [ ! -f entry_private.key ]; then
-    echo "[*] 生成入口服务器密钥..."
+
+  # ==== 入口本机私钥：可自填/用旧的/自动生成 ====
+  if [ -f entry_private.key ]; then
+    CUR_ENTRY_PRIV=$(cat entry_private.key 2>/dev/null || true)
+    if [[ -n "$CUR_ENTRY_PRIV" ]]; then
+      echo "[*] 当前已有入口服务器私钥："
+      echo "    $CUR_ENTRY_PRIV"
+    fi
+  fi
+  read -rp "入口服务器私钥(留空则使用现有 / 自动生成): " INPUT_ENTRY_PRIV
+
+  if [[ -n "$INPUT_ENTRY_PRIV" ]]; then
+    echo "[*] 使用你输入的入口私钥。"
     umask 077
-    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
+    echo "$INPUT_ENTRY_PRIV" > entry_private.key
+    echo "$INPUT_ENTRY_PRIV" | wg pubkey > entry_public.key
+  else
+    if [ -f entry_private.key ]; then
+      echo "[*] 使用已有入口私钥文件。"
+    else
+      echo "[*] 未检测到已有私钥，自动生成入口服务器密钥..."
+      umask 077
+      wg genkey | tee entry_private.key | wg pubkey > entry_public.key
+    fi
   fi
 
   ENTRY_PRIVATE_KEY=$(cat entry_private.key)
@@ -658,8 +760,26 @@ configure_entry() {
 
   local endpoint="127.0.0.1:${UDP2RAW_LOCAL_PORT}"
 
-  read -rp "请输入【出口服务器公钥】: " EXIT_PUBLIC_KEY
-  EXIT_PUBLIC_KEY=${EXIT_PUBLIC_KEY:-CHANGE_ME_EXIT_PUBLIC_KEY}
+  # ==== 对端（出口）公钥：记住 + 显示 + 可覆盖 ====
+  if [[ -f "$EXIT_PEER_PUB_FILE" ]]; then
+    OLD_EXIT_PUB=$(cat "$EXIT_PEER_PUB_FILE" 2>/dev/null || true)
+    if [[ -n "$OLD_EXIT_PUB" ]]; then
+      echo "[*] 检测到已有出口服务器公钥："
+      echo "    $OLD_EXIT_PUB"
+    fi
+  fi
+  read -rp "请输入【出口服务器公钥】(留空则使用上面已有的 / 默认占位): " EXIT_PUBLIC_KEY
+
+  if [[ -z "$EXIT_PUBLIC_KEY" ]]; then
+    if [[ -n "$OLD_EXIT_PUB" ]]; then
+      EXIT_PUBLIC_KEY="$OLD_EXIT_PUB"
+      echo "[*] 使用已有出口服务器公钥。"
+    else
+      EXIT_PUBLIC_KEY="CHANGE_ME_EXIT_PUBLIC_KEY"
+      echo "[*] 未提供出口公钥，先写入占位符：$EXIT_PUBLIC_KEY"
+    fi
+  fi
+  echo "$EXIT_PUBLIC_KEY" > "$EXIT_PEER_PUB_FILE"
 
   cat > /etc/wireguard/${WG_IF}.conf <<EOF
 [Interface]
@@ -761,6 +881,162 @@ manage_entry_ports() {
   done
 }
 
+# ====================== 出口：多入口管理 ======================
+
+exit_list_peers() {
+  if [[ ! -f "$EXIT_PEERS_DB" ]] || [[ ! -s "$EXIT_PEERS_DB" ]]; then
+    echo "当前没有配置任何入口 Peer。"
+    return
+  fi
+  echo "==== 出口已配置的入口列表 ===="
+  nl -ba "$EXIT_PEERS_DB" | while IFS='|' read -r ln rest; do
+    # ln 类似 "1 name|pub|aips|enabled"
+    idx=$(echo "$ln" | awk '{print $1}')
+    line=$(echo "$ln" | cut -d' ' -f2-)
+    name=$(echo "$line" | awk -F'|' '{print $1}')
+    pub=$(echo "$line" | awk -F'|' '{print $2}')
+    aips=$(echo "$line" | awk -F'|' '{print $3}')
+    enabled=$(echo "$line" | awk -F'|' '{print $4}')
+    status="停用"
+    [[ "$enabled" == "1" ]] && status="启用"
+    echo "#${idx}  名称: ${name}  状态: ${status}"
+    echo "     AllowedIPs: ${aips}"
+    echo "     PublicKey : ${pub}"
+  done
+}
+
+exit_add_peer() {
+  echo "==== 在出口新增一个入口 Peer ===="
+  read -rp "入口名称(如 entry2): " name
+  if [[ -z "$name" ]]; then
+    echo "名称不能为空。"
+    return
+  fi
+
+  read -rp "入口的 WireGuard 内网网段/掩码 (如 10.0.0.3/32): " aips
+  if [[ -z "$aips" ]]; then
+    echo "AllowedIPs 不能为空。"
+    return
+  fi
+
+  local LAST_ENTRY_PUB=""
+  if [[ -f "$ENTRY_PEER_PUB_FILE" ]]; then
+    LAST_ENTRY_PUB=$(cat "$ENTRY_PEER_PUB_FILE" 2>/dev/null || true)
+    if [[ -n "$LAST_ENTRY_PUB" ]]; then
+      echo "[*] 上次使用的入口公钥："
+      echo "    $LAST_ENTRY_PUB"
+    fi
+  fi
+
+  read -rp "入口服务器公钥(留空则使用上次记录的 / 必填): " pkey
+  if [[ -z "$pkey" ]]; then
+    if [[ -n "$LAST_ENTRY_PUB" ]]; then
+      pkey="$LAST_ENTRY_PUB"
+      echo "[*] 使用上次记录的入口公钥。"
+    else
+      echo "❌ 没有可用公钥，添加失败。"
+      return
+    fi
+  fi
+
+  echo "$pkey" > "$ENTRY_PEER_PUB_FILE"
+
+  mkdir -p /etc/wireguard
+  touch "$EXIT_PEERS_DB"
+  echo "${name}|${pkey}|${aips}|1" >> "$EXIT_PEERS_DB"
+
+  echo "[*] 已写入 Peer 配置，正在重建 wg0.conf 并重启 WireGuard..."
+  rebuild_exit_wg_conf
+  systemctl restart wg-quick@${WG_IF}.service || wg-quick up ${WG_IF}
+  echo "✅ 新入口已添加并启用。"
+}
+
+exit_delete_peer() {
+  if [[ ! -f "$EXIT_PEERS_DB" ]] || [[ ! -s "$EXIT_PEERS_DB" ]]; then
+    echo "没有可删除的入口。"
+    return
+  fi
+
+  exit_list_peers
+  read -rp "请输入要删除的入口序号(#编号): " idx
+  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+    echo "序号不合法。"
+    return
+  fi
+
+  total=$(wc -l < "$EXIT_PEERS_DB")
+  if (( idx < 1 || idx > total )); then
+    echo "序号超出范围。"
+    return
+  fi
+
+  sed -i "${idx}d" "$EXIT_PEERS_DB"
+
+  echo "[*] 已删除该入口 Peer，正在重建配置并重启 wg..."
+  rebuild_exit_wg_conf
+  systemctl restart wg-quick@${WG_IF}.service || wg-quick up ${WG_IF}
+  echo "✅ 入口已删除。"
+}
+
+exit_toggle_peer() {
+  if [[ ! -f "$EXIT_PEERS_DB" ]] || [[ ! -s "$EXIT_PEERS_DB" ]]; then
+    echo "没有可操作的入口。"
+    return
+  fi
+
+  exit_list_peers
+  read -rp "请输入要启用/停用的入口序号(#编号): " idx
+  if ! [[ "$idx" =~ ^[0-9]+$ ]]; then
+    echo "序号不合法。"
+    return
+  fi
+
+  total=$(wc -l < "$EXIT_PEERS_DB")
+  if (( idx < 1 || idx > total )); then
+    echo "序号超出范围。"
+    return
+  fi
+
+  tmpfile=$(mktemp)
+  awk -F'|' -v n="$idx" 'NR==n{
+      name=$1; pk=$2; aips=$3; en=$4;
+      if(en=="1") en="0"; else en="1";
+      printf("%s|%s|%s|%s\n",name,pk,aips,en);
+      next
+    }1' "$EXIT_PEERS_DB" > "$tmpfile"
+  mv "$tmpfile" "$EXIT_PEERS_DB"
+
+  echo "[*] 已切换该入口启用/停用状态，正在重建配置并重启 wg..."
+  rebuild_exit_wg_conf
+  systemctl restart wg-quick@${WG_IF}.service || wg-quick up ${WG_IF}
+  echo "✅ 已应用修改。"
+}
+
+manage_exit_peers() {
+  echo "==== 出口服务器 多入口管理 ===="
+  while true; do
+    echo
+    echo "---- 出口入口管理菜单 ----"
+    echo "1) 查看所有入口 Peer"
+    echo "2) 新增入口 Peer"
+    echo "3) 删除入口 Peer"
+    echo "4) 启用/停用 某个入口 Peer"
+    echo "0) 返回主菜单"
+    echo "--------------------------"
+    read -rp "请选择: " sub
+    case "$sub" in
+      1) exit_list_peers ;;
+      2) exit_add_peer ;;
+      3) exit_delete_peer ;;
+      4) exit_toggle_peer ;;
+      0) break ;;
+      *) echo "无效选项。" ;;
+    esac
+  done
+}
+
+# ====================== 通用操作 ======================
+
 show_status() {
   echo "==== WireGuard 状态 ===="
   if command -v wg >/dev/null 2>&1; then
@@ -805,7 +1081,7 @@ uninstall_wg() {
   echo "==== 卸载 WG-Raw ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置、角色信息、多入口配置"
   echo "  - 移除策略路由 / iptables 标记"
   echo "  - 停用并删除 udp2raw systemd 服务和配置"
   echo "  - 删除 udp2raw 二进制"
@@ -822,6 +1098,7 @@ uninstall_wg() {
       ip route flush table 100 2>/dev/null || true
 
       clear_mark_rules
+      iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true
 
       systemctl stop udp2raw-exit.service 2>/dev/null || true
       systemctl disable udp2raw-exit.service 2>/dev/null || true
@@ -830,11 +1107,15 @@ uninstall_wg() {
       rm -f /etc/systemd/system/udp2raw-exit.service /etc/systemd/system/udp2raw-entry.service 2>/dev/null || true
       systemctl daemon-reload || true
 
+      # 清理 wg 配置和多入口相关
       rm -f /etc/wireguard/${WG_IF}.conf \
+            /etc/wireguard/${WG_IF}.interface \
+            /etc/wireguard/${WG_IF}.peers \
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
-            "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" 2>/dev/null || true
+            "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" \
+            "$ROLE_FILE" "$ENTRY_PEER_PUB_FILE" "$EXIT_PEER_PUB_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
       rm -rf "$UDP2RAW_WORKDIR" 2>/dev/null || true
@@ -844,7 +1125,7 @@ uninstall_wg() {
       apt remove -y wireguard wireguard-tools 2>/dev/null || true
       apt autoremove -y 2>/dev/null || true
 
-      echo "✅ WireGuard 与 udp2raw 已卸载，配置和端口分流规则已清理。"
+      echo "✅ WireGuard 与 udp2raw 已卸载，配置和端口分流/转发规则已尽量清理。"
       echo "✅ 正在删除当前脚本：$0"
       rm -f "$0" 2>/dev/null || true
       echo "✅ 脚本已删除，退出。"
@@ -856,9 +1137,12 @@ uninstall_wg() {
   esac
 }
 
+# ====================== 主菜单 ======================
+
 while true; do
   echo
   echo "================ 📡 WG-Raw 一键脚本 ================"
+  echo "当前角色: $(get_role)"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WG-Raw 状态"
@@ -867,9 +1151,10 @@ while true; do
   echo "6) 重启 WG-Raw"
   echo "7) 卸载 WG-Raw"
   echo "8) 管理入口端口分流"
-  echo "9) 管理入口模式（全局 / 分流）"
+  echo "9) 管理入口模式"
+  echo "10) 管理出口的多个入口 Peer"
   echo "0) 退出"
-  echo "=================================================================="
+  echo "===================================================="
   read -rp "请选择: " choice
 
   case "$choice" in
@@ -880,8 +1165,27 @@ while true; do
     5) stop_wg ;;
     6) restart_wg ;;
     7) uninstall_wg ;;
-    8) manage_entry_ports ;;
-    9) manage_entry_mode ;;
+    8)
+      if [[ $(get_role) != "entry" ]]; then
+        echo "当前不是【入口服务器】，该菜单仅在入口服务器上可用。"
+      else
+        manage_entry_ports
+      fi
+      ;;
+    9)
+      if [[ $(get_role) != "entry" ]]; then
+        echo "当前不是【入口服务器】，该菜单仅在入口服务器上可用。"
+      else
+        manage_entry_mode
+      fi
+      ;;
+    10)
+      if [[ $(get_role) != "exit" ]]; then
+        echo "当前不是【出口服务器】，该菜单仅在出口服务器上可用。"
+      else
+        manage_exit_peers
+      fi
+      ;;
     0) exit 0 ;;
     *) echo "无效选项。" ;;
   esac
