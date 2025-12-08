@@ -187,9 +187,13 @@ configure_exit() {
   PUB_IP_DETECTED=$(detect_public_ip || true)
   if [[ -n "$PUB_IP_DETECTED" ]]; then
     echo "[*] 检测到出口服务器公网 IP：$PUB_IP_DETECTED"
+    read -rp "出口服务器公网 IP (默认自动检测到的 IP): " EXIT_PUBLIC_IP
+    EXIT_PUBLIC_IP=${EXIT_PUBLIC_IP:-$PUB_IP_DETECTED}
   else
-    echo "[*] 未能自动检测公网 IP，请查看服务商面板。"
+    echo "[*] 未能自动检测公网 IP，请手动输入。"
+    read -rp "出口服务器公网 IP: " EXIT_PUBLIC_IP
   fi
+
 
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.1/24}
@@ -282,7 +286,7 @@ EOF
 
   echo
   echo "====== udp2raw 连接信息（给入口服务器用）======"
-  echo "出口公网 IP：${PUB_IP_DETECTED:-<你的出口公网IP>}"
+  echo "出口公网 IP：${EXIT_PUBLIC_IP}"
   echo "udp2raw 监听端口：${UDP2RAW_PORT}"
   echo "PSK：${UDP2RAW_PSK}"
   echo "raw-mode：faketcp"
