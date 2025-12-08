@@ -5,15 +5,15 @@ WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
 MODE_FILE="/etc/wireguard/.wg_mode"
 EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"
-ROLE_FILE="/etc/wireguard/.wg_role"              # entry / exit
+ROLE_FILE="/etc/wireguard/.wg_role"            
 
 # 出口多入口相关
-EXIT_IFACE_FILE="/etc/wireguard/${WG_IF}.interface"  # 只保存 [Interface]
-EXIT_PEERS_DB="/etc/wireguard/${WG_IF}.peers"        # name|pubkey|allowed_ips|enabled(1/0)
+EXIT_IFACE_FILE="/etc/wireguard/${WG_IF}.interface" 
+EXIT_PEERS_DB="/etc/wireguard/${WG_IF}.peers"      
 
 # 对端公钥记忆文件
-ENTRY_PEER_PUB_FILE="/etc/wireguard/.entry_peer_pub"  # 出口机上，记录入口的公钥（最近一次）
-EXIT_PEER_PUB_FILE="/etc/wireguard/.exit_peer_pub"    # 入口机上，记录出口的公钥（最近一次）
+ENTRY_PEER_PUB_FILE="/etc/wireguard/.entry_peer_pub" 
+EXIT_PEER_PUB_FILE="/etc/wireguard/.exit_peer_pub"   
 
 # udp2raw 相关
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
@@ -1152,7 +1152,7 @@ while true; do
   echo "7) 卸载 WG-Raw"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式"
-  echo "10) 管理出口的多个入口 Peer"
+  echo "10) 管理入口 Peer"
   echo "0) 退出"
   echo "===================================================="
   read -rp "请选择: " choice
