@@ -3,8 +3,24 @@ set -e
 
 WG_IF="wg0"
 PORT_LIST_FILE="/etc/wireguard/.wg_ports"
-MODE_FILE="/etc/wireguard/.wg_mode" 
-EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip" 
+MODE_FILE="/etc/wireguard/.wg_mode"
+EXIT_WG_IP_FILE="/etc/wireguard/.exit_wg_ip"
+ROLE_FILE="/etc/wireguard/.wg_role"
+
+# 角色相关：entry / exit
+get_role() {
+  if [[ -f "$ROLE_FILE" ]]; then
+    cat "$ROLE_FILE" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
+}
+
+set_role() {
+  local role="$1"
+  mkdir -p "$(dirname "$ROLE_FILE")"
+  echo "$role" > "$ROLE_FILE"
+}
 
 # udp2raw 相关
 UDP2RAW_BIN="/usr/local/bin/udp2raw"
@@ -180,6 +196,7 @@ detect_public_ip() {
 # ====================== 出口服务器配置 ======================
 configure_exit() {
   echo "==== 配置为【出口服务器】 ===="
+  set_role "exit"
 
   install_wireguard
   install_udp2raw
@@ -196,8 +213,6 @@ configure_exit() {
 
   echo "👉 最终使用的出口公网 IP：$EXIT_PUBLIC_IP"
   echo
-
-
 
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.1/24}
@@ -392,7 +407,6 @@ get_wan_if() {
   echo "${wan:-eth0}"
 }
 
-
 add_forward_port_mapping() {
   local port="$1"
   local exit_ip
@@ -450,7 +464,7 @@ remove_forward_port_mapping() {
   echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
 
-# === 新增：全局模式下的“全端口 1:1 转发 A→B” ===
+# === 全局模式下的“全端口 1:1 转发 A→B”（排除 22）===
 
 enable_full_port_forward_to_exit_all() {
   local exit_ip
@@ -470,23 +484,27 @@ enable_full_port_forward_to_exit_all() {
   echo "[*] 开启【全端口 1:1 转发】：A 公网 IP:任意 TCP 端口 → B(${exit_ip}):同端口（经 ${WG_IF}）"
   echo "    外网网卡: ${wan_if}"
 
-  # 1) PREROUTING：所有从外网进来的 TCP，DNAT 到 B（端口保持不变）
-  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp -j DNAT --to-destination "${exit_ip}"
+  # 保护 22 端口：对 dport=22 直接 RETURN，不做 DNAT
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN 2>/dev/null || \
+    iptables -t nat -I PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN
 
-  # 2) FORWARD：外网 -> wg0 放行
+  # 其它 TCP 端口（非 22）全部 DNAT 到 B（端口保持不变）
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
+
+  # FORWARD：外网 -> wg0 放行
   iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
 
-  # 3) FORWARD：wg0 -> 外网 放行回程
+  # FORWARD：wg0 -> 外网 放行回程
   iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-  # 4) 出 wg0 做 SNAT/MASQUERADE
+  # 出 wg0 做 SNAT/MASQUERADE
   iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
-  echo "✅ 已开启【全端口 1:1 转发】：O → A:任意 TCP 端口 = O → B(${exit_ip}):同端口"
+  echo "✅ 已开启【全端口 1:1 转发】(排除 22)：O → A:任意 TCP 端口 ≈ O → B(${exit_ip}):同端口"
 }
 
 enable_global_mode() {
@@ -508,7 +526,7 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -o lo -j RETURN
 
-  # 保护 SSH
+  # 保护 SSH（本机发出的源端口 22）
   iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
 
@@ -541,11 +559,11 @@ enable_global_mode() {
   # 兜底再设一遍 wg0 MTU
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
-  # 全局模式下，同时开启【全端口 1:1 A→B 转发】
+  # 全局模式下，同时开启【全端口 1:1 A→B 转发】（排除 22）
   enable_full_port_forward_to_exit_all
 
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，本机出站全走出口，且 A 公网所有 TCP 端口 1:1 映射到出口 B。"
+  echo "✅ 已切到【全局模式】，本机出站全走出口，且 A 公网所有 TCP 端口(不含 22) 1:1 映射到出口 B。"
 }
 
 enable_split_mode() {
@@ -597,6 +615,7 @@ manage_entry_mode() {
 
 configure_entry() {
   echo "==== 配置为【入口服务器】 ===="
+  set_role "entry"
 
   install_wireguard
   install_udp2raw
@@ -742,10 +761,14 @@ manage_entry_ports() {
       2)
         read -rp "请输入要添加的端口(单个数字，如 8080): " new_port
         if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ]; then
-          add_port_to_list "$new_port"
-          ensure_policy_routing_for_ports
-          apply_port_rules_from_file
-          add_forward_port_mapping "$new_port"
+          if [ "$new_port" -eq 22 ]; then
+            echo "出于安全考虑，禁止将 22 加入分流/映射列表。"
+          else
+            add_port_to_list "$new_port"
+            ensure_policy_routing_for_ports
+            apply_port_rules_from_file
+            add_forward_port_mapping "$new_port"
+          fi
         else
           echo "端口不合法。"
         fi
@@ -770,6 +793,9 @@ manage_entry_ports() {
 }
 
 show_status() {
+  echo "==== 当前角色 ===="
+  echo "角色：$(get_role) (entry=入口 / exit=出口 / unknown=未配置)"
+  echo
   echo "==== WireGuard 状态 ===="
   if command -v wg >/dev/null 2>&1; then
     wg show || echo "wg0 似乎还没配置/启动。"
@@ -813,7 +839,7 @@ uninstall_wg() {
   echo "==== 卸载 WG-Raw ===="
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
-  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置"
+  echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置、角色标记"
   echo "  - 移除策略路由 / iptables 标记"
   echo "  - 停用并删除 udp2raw systemd 服务和配置"
   echo "  - 删除 udp2raw 二进制"
@@ -842,7 +868,7 @@ uninstall_wg() {
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
-            "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" 2>/dev/null || true
+            "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" "$ROLE_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
       rm -rf "$UDP2RAW_WORKDIR" 2>/dev/null || true
@@ -888,8 +914,20 @@ while true; do
     5) stop_wg ;;
     6) restart_wg ;;
     7) uninstall_wg ;;
-    8) manage_entry_ports ;;
-    9) manage_entry_mode ;;
+    8)
+      if [[ "$(get_role)" != "entry" ]]; then
+        echo "❌ 当前标记为【出口】或未配置为入口，本菜单仅在【入口服务器】上使用。"
+      else
+        manage_entry_ports
+      fi
+      ;;
+    9)
+      if [[ "$(get_role)" != "entry" ]]; then
+        echo "❌ 当前标记为【出口】或未配置为入口，本菜单仅在【入口服务器】上使用。"
+      else
+        manage_entry_mode
+      fi
+      ;;
     0) exit 0 ;;
     *) echo "无效选项。" ;;
   esac
