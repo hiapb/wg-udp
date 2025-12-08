@@ -194,6 +194,10 @@ configure_exit() {
     read -rp "出口服务器公网 IP: " EXIT_PUBLIC_IP
   fi
 
+  echo "👉 最终使用的出口公网 IP：$EXIT_PUBLIC_IP"
+  echo
+
+
 
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.1/24}
