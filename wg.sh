@@ -11,7 +11,7 @@ ROLE_FILE="/etc/wireguard/.wg_role"              # entry / exit
 EXIT_IFACE_FILE="/etc/wireguard/${WG_IF}.interface"  # 只保存 [Interface]
 EXIT_PEERS_DB="/etc/wireguard/${WG_IF}.peers"        # name|pubkey|allowed_ips|enabled(1/0)
 
-# 对端公钥记忆文件（简易记一次最近用的）
+# 对端公钥记忆文件
 ENTRY_PEER_PUB_FILE="/etc/wireguard/.entry_peer_pub"  # 出口机上，记录入口的公钥（最近一次）
 EXIT_PEER_PUB_FILE="/etc/wireguard/.exit_peer_pub"    # 入口机上，记录出口的公钥（最近一次）
 
@@ -259,7 +259,7 @@ configure_exit() {
       echo "    $CUR_EXIT_PRIV"
     fi
   fi
-  read -rp "出口服务器私钥(留空则使用现有 / 自动生成): " INPUT_EXIT_PRIV
+  read -rp "出口服务器私钥(留空默认): " INPUT_EXIT_PRIV
 
   if [[ -n "$INPUT_EXIT_PRIV" ]]; then
     echo "[*] 使用你输入的出口私钥。"
@@ -293,7 +293,7 @@ configure_exit() {
       echo "    $OLD_ENTRY_PUB"
     fi
   fi
-  read -rp "请输入【第一个入口服务器公钥】(留空则使用上面的 / 默认占位): " ENTRY_PUBLIC_KEY
+  read -rp "请输入【入口服务器公钥】(留空默认): " ENTRY_PUBLIC_KEY
 
   if [[ -z "$ENTRY_PUBLIC_KEY" ]]; then
     if [[ -n "$OLD_ENTRY_PUB" ]]; then
@@ -715,7 +715,7 @@ configure_entry() {
       echo "    $CUR_ENTRY_PRIV"
     fi
   fi
-  read -rp "入口服务器私钥(留空则使用现有 / 自动生成): " INPUT_ENTRY_PRIV
+  read -rp "入口服务器私钥(留空默认): " INPUT_ENTRY_PRIV
 
   if [[ -n "$INPUT_ENTRY_PRIV" ]]; then
     echo "[*] 使用你输入的入口私钥。"
@@ -768,7 +768,7 @@ configure_entry() {
       echo "    $OLD_EXIT_PUB"
     fi
   fi
-  read -rp "请输入【出口服务器公钥】(留空则使用上面已有的 / 默认占位): " EXIT_PUBLIC_KEY
+  read -rp "请输入【出口服务器公钥】(留空默认): " EXIT_PUBLIC_KEY
 
   if [[ -z "$EXIT_PUBLIC_KEY" ]]; then
     if [[ -n "$OLD_EXIT_PUB" ]]; then
