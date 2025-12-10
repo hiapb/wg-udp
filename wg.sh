@@ -805,7 +805,7 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ 📡 WG-Raw 一键脚本 ================"
+  echo "================ 📡 WG-Raw 一键脚本测试 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WG-Raw 状态"
