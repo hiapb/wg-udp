@@ -411,7 +411,7 @@ set_mode_flag() {
   echo "$mode" > "$MODE_FILE"
 }
 
-# === 新增：一些公共小工具 ===
+# === 一些公共小工具 ===
 
 enable_ip_forward_global() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -426,7 +426,7 @@ get_wan_if() {
   echo "${wan:-eth0}"
 }
 
-# A:port → B:port 端口转发 + 经 wg0
+# A:port → B:port 端口转发（走 wg0）
 add_forward_port_mapping() {
   local port="$1"
   local exit_ip
@@ -445,23 +445,29 @@ add_forward_port_mapping() {
   enable_ip_forward_global
   wan_if=$(get_wan_if)
 
-  # 1) 外网来 A:port 时，先按目标端口打 mark=0x1 → 走 table100 → wg0
-  iptables -t mangle -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1 2>/dev/null || \
-    iptables -t mangle -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1
+  # 关键：主路由表里给出口 wg IP 加一条直连走 wg0
+  # 发往 exit_ip 的流量一定从 wg0 出去
+  ip route replace "${exit_ip}/32" dev "${WG_IF}"
 
-  # 2) A:port → DNAT 到 B_wg_ip:port
-  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+  # A:port → DNAT 到 B_wg_ip:port（不再打 mark，避免和其它策略路由冲突）
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" \
+    -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
+  iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" \
+    -j DNAT --to-destination "${exit_ip}:${port}"
 
-  # 3) FORWARD：外网 → wg0 方向放行
-  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+  # FORWARD：外网 -> wg0
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" \
+    -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" \
+    -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
 
-  # 4) FORWARD：wg0 → 外网 放行回程
-  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+  # FORWARD：wg0 -> 外网
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" \
+    -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
+  iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" \
+    -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-  # 5) 出 wg0 时 SNAT/MASQUERADE（兜底）
+  # 出 wg0 时 SNAT/MASQUERADE（兜底）
   iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
@@ -481,18 +487,18 @@ remove_forward_port_mapping() {
   [[ -z "$exit_ip" ]] && return 0
   wan_if=$(get_wan_if)
 
-  # 删除 mangle PREROUTING 的 mark
-  iptables -t mangle -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1 2>/dev/null || true
-
-  # 删除 DNAT 和 FORWARD
-  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
-  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" \
+    -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" \
+    -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" \
+    -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
 
   echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
 
-# === 全局模式下的“全端口 1:1 转发 A→B”（排除 22）===
+# === 全局模式下原来的“全端口 1:1 转发 A→B”（排除 22）
+# 现在保留函数，但默认不再调用，避免抢占所有端口导致其它转发失效 ===
 
 enable_full_port_forward_to_exit_all() {
   local exit_ip
@@ -611,17 +617,17 @@ enable_global_mode() {
   # 兜底再设一遍 wg0 MTU
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
-  # 全局模式下，同时开启【全端口 1:1 A→B 转发】（排除 22）
-  enable_full_port_forward_to_exit_all
+  # ⚠ 不再默认开启全端口 1:1 转发，避免影响其他端口转发
+  # enable_full_port_forward_to_exit_all
 
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，本机出站全走出口，且 A 公网所有 TCP 端口(不含 22) 1:1 映射到出口 B。"
+  echo "✅ 已切到【全局模式】，本机出站全走出口（不会抢占所有外部端口 DNAT）。"
 }
 
 enable_split_mode() {
   echo "[*] 切换为【端口分流模式】..."
 
-  # 退回分流时，先关掉全局模式下的全端口 1:1 转发
+  # 退回分流时，先关掉全局模式下的全端口 1:1 转发（即便没开也无所谓）
   disable_full_port_forward_to_exit_all
 
   ensure_policy_routing_for_ports
@@ -790,7 +796,7 @@ manage_entry_ports() {
   echo "  - 管的是【入口这台机器】本地和转发流量的目标端口分流规则；"
   echo "  - 目标端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
   echo "  - 同时：从外部打到入口 A:该端口的 TCP，会转发到出口 B 的 WG 内网 IP:同端口；"
-  echo "  - 其它端口流量 → 走入口自己的公网。"
+  echo "  - 其它端口流量 → 走入口自己的公网或你已有的转发规则。"
   echo
 
   ensure_policy_routing_for_ports
@@ -833,7 +839,7 @@ manage_entry_ports() {
         read -rp "请输入要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
-          remove_port_iptables_rules "$del_port"
+          remove_port_iptables_rules("$del_port")
           remove_forward_port_mapping "$del_port"
         else
           echo "端口不合法。"
@@ -948,7 +954,7 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ 📡 WG-Raw 一键脚本 ================"
+  echo "================ 📡 WG-Raw 一键脚本测试 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WG-Raw 状态"
