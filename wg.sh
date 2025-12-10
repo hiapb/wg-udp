@@ -329,7 +329,7 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
-# 清理 mangle 表里所有打 MARK 的规则（OUTPUT + PREROUTING）
+# 清理 mangle 表里由本脚本加的 MARK 规则（OUTPUT + PREROUTING）
 clear_mark_rules() {
   for chain in OUTPUT PREROUTING; do
     iptables -t mangle -S "$chain" 2>/dev/null | grep " MARK " \
@@ -339,7 +339,7 @@ clear_mark_rules() {
   done
 }
 
-# 端口分流规则（按目标端口 dport）
+# 端口分流：按目标端口（dport）分流，本机出站 + 转发流量都打 mark=0x1
 apply_port_rules_from_file() {
   clear_mark_rules
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
@@ -348,13 +348,13 @@ apply_port_rules_from_file() {
     [[ -z "$p" ]] && continue
     [[ "$p" =~ ^# ]] && continue
 
-    # 本机出站：按目标端口分流
+    # 本机出站：目标端口在列表中 → 走 wg（fwmark 0x1 → table100）
     iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
       iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
       iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
 
-    # 转发流量：同样按目标端口分流（给内网设备用）
+    # 转发流量：O → A:port，同样按 dport 打 mark
     iptables -t mangle -C PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
       iptables -t mangle -A PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
@@ -445,29 +445,28 @@ add_forward_port_mapping() {
   enable_ip_forward_global
   wan_if=$(get_wan_if)
 
-  # 关键：主路由表里给出口 wg IP 加一条直连走 wg0
-  # 发往 exit_ip 的流量一定从 wg0 出去
+  # 确保发往 exit_ip 会经 wg0 走（一般 wg 配置本身就有路由，这里兜底）
   ip route replace "${exit_ip}/32" dev "${WG_IF}"
 
-  # A:port → DNAT 到 B_wg_ip:port（不再打 mark，避免和其它策略路由冲突）
+  # 1) O → A:port，在 A 上 DNAT 到 B_wg_ip:port
   iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" \
     -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
   iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" \
     -j DNAT --to-destination "${exit_ip}:${port}"
 
-  # FORWARD：外网 -> wg0
+  # 2) FORWARD：外网 -> wg0 放行
   iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" \
     -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
   iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" \
     -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
 
-  # FORWARD：wg0 -> 外网
+  # 3) FORWARD：wg0 -> 外网 放行回程
   iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" \
     -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
   iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" \
     -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-  # 出 wg0 时 SNAT/MASQUERADE（兜底）
+  # 4) 出 wg0 时 SNAT/MASQUERADE（兜底）
   iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
@@ -497,80 +496,11 @@ remove_forward_port_mapping() {
   echo "✅ 已尝试移除 A:${port} → B(${exit_ip}):${port} 的转发规则。"
 }
 
-# === 全局模式下原来的“全端口 1:1 转发 A→B”（排除 22）
-# 现在保留函数，但默认不再调用，避免抢占所有端口导致其它转发失效 ===
-
-enable_full_port_forward_to_exit_all() {
-  local exit_ip
-  local wan_if
-
-  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
-    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
-  fi
-  if [[ -z "$exit_ip" ]]; then
-    echo "⚠ 未找到出口 WG 内网 IP (${EXIT_WG_IP_FILE})，跳过全端口 1:1 转发配置。"
-    return 0
-  fi
-
-  enable_ip_forward_global
-  wan_if=$(get_wan_if)
-
-  echo "[*] 开启【全端口 1:1 转发】：A 公网 IP:任意 TCP 端口 → B(${exit_ip}):同端口（经 ${WG_IF}）"
-  echo "    外网网卡: ${wan_if}"
-
-  # 保护 22 端口：对 dport=22 直接 RETURN，不做 DNAT
-  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN 2>/dev/null || \
-    iptables -t nat -I PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN
-
-  # 其它 TCP 端口（非 22）全部 DNAT 到 B（端口保持不变）
-  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
-
-  # FORWARD：外网 -> wg0 放行
-  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
-
-  # FORWARD：wg0 -> 外网 放行回程
-  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-  # 出 wg0 做 SNAT/MASQUERADE
-  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
-    iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
-
-  echo "✅ 已开启【全端口 1:1 转发】(排除 22)：O → A:任意 TCP 端口 ≈ O → B(${exit_ip}):同端口"
-}
-
-disable_full_port_forward_to_exit_all() {
-  local exit_ip
-  local wan_if
-
-  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
-    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
-  fi
-  [[ -z "$exit_ip" ]] && return 0
-
-  wan_if=$(get_wan_if)
-
-  # 删掉保护 22 的 RETURN
-  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN 2>/dev/null || true
-
-  # 删掉「其它端口全部 DNAT 到 B」这条
-  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
-
-  # 删掉 FORWARD 放行
-  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-
-  echo "✅ 已关闭【全端口 1:1 转发 A→B】规则。"
-}
-
 enable_global_mode() {
   echo "[*] 切换为【全局模式】..."
   ensure_policy_routing_for_ports
   clear_mark_rules
 
-  # 读取 udp2raw 远端端口（客户端向这个端口发包）
   local UDP2RAW_REMOTE_PORT="$UDP2RAW_DEFAULT_PORT"
   if [[ -f "$UDP2RAW_REMOTE_FILE" ]]; then
     local remote_str
@@ -579,6 +509,9 @@ enable_global_mode() {
       UDP2RAW_REMOTE_PORT="${remote_str##*:}"
     fi
   fi
+
+  local wan_if
+  wan_if=$(get_wan_if)
 
   # 不处理 lo
   iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || \
@@ -610,25 +543,23 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
 
-  # 其余所有出站流量全部打 mark=0x1 → table100 → wg0
+  # 本机出站：其余所有出站流量全部打 mark=0x1 → table100 → wg0
   iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || \
     iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
+
+  # 转发流量：从外网网卡进来的，也打 mark=0x1 → 走 wg0（实现 A 转发 C 也经 B）
+  iptables -t mangle -C PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1 2>/dev/null || \
+    iptables -t mangle -A PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1
 
   # 兜底再设一遍 wg0 MTU
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
-  # ⚠ 不再默认开启全端口 1:1 转发，避免影响其他端口转发
-  # enable_full_port_forward_to_exit_all
-
   set_mode_flag "global"
-  echo "✅ 已切到【全局模式】，本机出站全走出口（不会抢占所有外部端口 DNAT）。"
+  echo "✅ 已切到【全局模式】，本机出站 + 从 O 经 A 转发到 C 的流量都会走 wg0 → B。"
 }
 
 enable_split_mode() {
   echo "[*] 切换为【端口分流模式】..."
-
-  # 退回分流时，先关掉全局模式下的全端口 1:1 转发（即便没开也无所谓）
-  disable_full_port_forward_to_exit_all
 
   ensure_policy_routing_for_ports
   clear_mark_rules
@@ -638,7 +569,7 @@ enable_split_mode() {
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   set_mode_flag "split"
-  echo "✅ 已切回【端口分流模式】，只有端口列表中目标端口才走出口。"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中目标端口才走出口，其它转发不受影响。"
 }
 
 apply_current_mode() {
@@ -835,18 +766,16 @@ manage_entry_ports() {
           echo "端口不合法。"
         fi
         ;;
-       3)
+      3)
         read -rp "请输入要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
-          # 这里不能写成 remove_port_iptables_rules("$del_port")
           remove_port_iptables_rules "$del_port"
           remove_forward_port_mapping "$del_port"
         else
           echo "端口不合法。"
         fi
         ;;
-
       0)
         break
         ;;
@@ -861,7 +790,7 @@ show_status() {
   echo "角色：$(get_role) (entry=入口 / exit=出口 / unknown=未配置)"
   echo
   echo "==== WireGuard 状态 ===="
-  if command -v wg >/dev/null 2>&1; then
+  if command -v wg >/dev/null 2>/dev/null; then
     wg show || echo "wg0 似乎还没配置/启动。"
   else
     echo "系统未安装 WireGuard。"
@@ -885,18 +814,35 @@ start_wg() {
 
 stop_wg() {
   echo "[*] 停止 WG-Raw (${WG_IF})..."
-  wg-quick down ${WG_IF} || true
+
+  wg-quick down ${WG_IF} 2>/dev/null || true
+  ip link set ${WG_IF} down 2>/dev/null || true
+  ip link del ${WG_IF} 2>/dev/null || true
+
+  # 删除残留路由（关键）
+  ip route del default dev ${WG_IF} 2>/dev/null || true
+  ip route del 10.0.0.0/24 dev ${WG_IF} 2>/dev/null || true
+  ip route del table 100 default dev ${WG_IF} 2>/dev/null || true
+
+  # 删除 fwmark 策略路由
+  ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+  ip route flush table 100 2>/dev/null || true
+
+  # 清除 mangle 标记规则
+  clear_mark_rules
+
+  # 删掉 MSS 修正规则（兜底删除）
+  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables -t mangle -D OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+
+  echo "✅ 已停止 wg0，并清除残留路由和标记规则。"
   wg show || true
 }
 
 restart_wg() {
   echo "[*] 重启 WG-Raw (${WG_IF})..."
-  wg-quick down ${WG_IF} 2>/dev/null || true
-  wg-quick up ${WG_IF} || true
-  ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
-  ensure_policy_routing_for_ports
-  apply_current_mode
-  wg show || true
+  stop_wg
+  start_wg
 }
 
 uninstall_wg() {
@@ -904,9 +850,8 @@ uninstall_wg() {
   echo "此操作将会："
   echo "  - 停止 wg-quick@${WG_IF} 服务并取消开机自启"
   echo "  - 删除 /etc/wireguard 内的配置、密钥、端口分流配置、模式配置、角色标记"
-  echo "  - 移除策略路由 / iptables 标记"
-  echo "  - 停用并删除 udp2raw systemd 服务和配置"
-  echo "  - 删除 udp2raw 二进制"
+  echo "  - 移除策略路由 / iptables 标记 / wg0 残留路由"
+  echo "  - 停用并删除 udp2raw systemd 服务和配置及二进制"
   echo "  - 删除当前脚本文件：$0"
   echo
   read -rp "确认卸载并删除脚本？(y/N): " confirm
@@ -915,12 +860,31 @@ uninstall_wg() {
       systemctl stop wg-quick@${WG_IF}.service 2>/dev/null || true
       systemctl disable wg-quick@${WG_IF}.service 2>/dev/null || true
       wg-quick down ${WG_IF} 2>/dev/null || true
+      ip link set ${WG_IF} down 2>/dev/null || true
+      ip link del ${WG_IF} 2>/dev/null || true
 
+      # 路由 & 策略路由
+      ip route del default dev ${WG_IF} 2>/dev/null || true
+      ip route del 10.0.0.0/24 dev ${WG_IF} 2>/dev/null || true
       ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
       ip route flush table 100 2>/dev/null || true
 
+      # 清除 mangle 标记 & MSS 规则
       clear_mark_rules
+      iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+      iptables -t mangle -D OUTPUT  -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 
+      # 端口映射规则（按列表一一删）
+      if [[ -f "$PORT_LIST_FILE" ]]; then
+        while read -r p; do
+          [[ -z "$p" ]] && continue
+          [[ "$p" =~ ^# ]] && continue
+          remove_port_iptables_rules "$p"
+          remove_forward_port_mapping "$p"
+        done < "$PORT_LIST_FILE"
+      fi
+
+      # 删 udp2raw 服务 & 文件
       systemctl stop udp2raw-exit.service 2>/dev/null || true
       systemctl disable udp2raw-exit.service 2>/dev/null || true
       systemctl stop udp2raw-entry.service 2>/dev/null || true
@@ -928,19 +892,16 @@ uninstall_wg() {
       rm -f /etc/systemd/system/udp2raw-exit.service /etc/systemd/system/udp2raw-entry.service 2>/dev/null || true
       systemctl daemon-reload || true
 
+      rm -rf "$UDP2RAW_WORKDIR" 2>/dev/null || true
+      rm -f "$UDP2RAW_BIN" 2>/dev/null || true
+
+      # 删 WG 配置文件和标记文件
       rm -f /etc/wireguard/${WG_IF}.conf \
             /etc/wireguard/exit_private.key /etc/wireguard/exit_public.key \
             /etc/wireguard/entry_private.key /etc/wireguard/entry_public.key \
             /etc/wireguard/.exit_public_ip \
             "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" "$ROLE_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
-
-      rm -rf "$UDP2RAW_WORKDIR" 2>/dev/null || true
-      rm -f "$UDP2RAW_BIN" 2>/dev/null || true
-
-      export DEBIAN_FRONTEND=noninteractive
-      apt remove -y wireguard wireguard-tools 2>/dev/null || true
-      apt autoremove -y 2>/dev/null || true
 
       echo "✅ WireGuard 与 udp2raw 已卸载，配置和端口分流规则已清理。"
       echo "✅ 正在删除当前脚本：$0"
@@ -956,7 +917,7 @@ uninstall_wg() {
 
 while true; do
   echo
-  echo "================ 📡 WG-Raw 一键脚本测试 ================"
+  echo "================ 📡 WG-Raw 一键脚本 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看 WG-Raw 状态"
