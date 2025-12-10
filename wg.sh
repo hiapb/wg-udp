@@ -835,16 +835,18 @@ manage_entry_ports() {
           echo "端口不合法。"
         fi
         ;;
-      3)
+       3)
         read -rp "请输入要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
-          remove_port_iptables_rules("$del_port")
+          # 这里不能写成 remove_port_iptables_rules("$del_port")
+          remove_port_iptables_rules "$del_port"
           remove_forward_port_mapping "$del_port"
         else
           echo "端口不合法。"
         fi
         ;;
+
       0)
         break
         ;;
