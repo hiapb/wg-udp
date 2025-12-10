@@ -329,23 +329,36 @@ ensure_policy_routing_for_ports() {
   ip route replace default dev ${WG_IF} table 100
 }
 
+# 清理 mangle 表里所有打 MARK 的规则（OUTPUT + PREROUTING）
 clear_mark_rules() {
-  iptables -t mangle -S OUTPUT 2>/dev/null | grep " MARK " \
-    | sed 's/^-A /-D /' | while read -r line; do
-        iptables -t mangle $line 2>/dev/null || true
-      done
+  for chain in OUTPUT PREROUTING; do
+    iptables -t mangle -S "$chain" 2>/dev/null | grep " MARK " \
+      | sed 's/^-A /-D /' | while read -r line; do
+          iptables -t mangle $line 2>/dev/null || true
+        done
+  done
 }
 
+# 端口分流规则（按目标端口 dport）
 apply_port_rules_from_file() {
   clear_mark_rules
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
+
   while read -r p; do
     [[ -z "$p" ]] && continue
     [[ "$p" =~ ^# ]] && continue
-    iptables -t mangle -C OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p tcp --sport "$p" -j MARK --set-mark 0x1
-    iptables -t mangle -C OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
-      iptables -t mangle -A OUTPUT -p udp --sport "$p" -j MARK --set-mark 0x1
+
+    # 本机出站：按目标端口分流
+    iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
+
+    # 转发流量：同样按目标端口分流（给内网设备用）
+    iptables -t mangle -C PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || \
+      iptables -t mangle -A PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1
   done < "$PORT_LIST_FILE"
 }
 
@@ -374,8 +387,14 @@ remove_port_from_list() {
 
 remove_port_iptables_rules() {
   local port="$1"
-  iptables -t mangle -D OUTPUT -p tcp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p udp --sport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+
+  # 本机出站
+  iptables -t mangle -D OUTPUT -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+
+  # 转发流量
+  iptables -t mangle -D PREROUTING -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
 }
 
 get_current_mode() {
@@ -407,6 +426,7 @@ get_wan_if() {
   echo "${wan:-eth0}"
 }
 
+# A:port → B:port 端口转发 + 经 wg0
 add_forward_port_mapping() {
   local port="$1"
   local exit_ip
@@ -425,18 +445,23 @@ add_forward_port_mapping() {
   enable_ip_forward_global
   wan_if=$(get_wan_if)
 
-  # 1) A:port → DNAT 到 B_wg_ip:port
+  # 1) 外网来 A:port 时，先按目标端口打 mark=0x1 → 走 table100 → wg0
+  iptables -t mangle -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1 2>/dev/null || \
+    iptables -t mangle -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1
+
+  # 2) A:port → DNAT 到 B_wg_ip:port
   iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
     iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
 
-  # 2) FORWARD: 外网 → wg0 方向放行这个端口的新连接+回程
+  # 3) FORWARD：外网 → wg0 方向放行
   iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
 
+  # 4) FORWARD：wg0 → 外网 放行回程
   iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
     iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-  # 3) 出 wg0 时 SNAT/MASQUERADE（兜底）
+  # 5) 出 wg0 时 SNAT/MASQUERADE（兜底）
   iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
@@ -456,7 +481,10 @@ remove_forward_port_mapping() {
   [[ -z "$exit_ip" ]] && return 0
   wan_if=$(get_wan_if)
 
-  # 尝试删除对应规则（用 -D + 完整匹配）
+  # 删除 mangle PREROUTING 的 mark
+  iptables -t mangle -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j MARK --set-mark 0x1 2>/dev/null || true
+
+  # 删除 DNAT 和 FORWARD
   iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
   iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
@@ -505,6 +533,30 @@ enable_full_port_forward_to_exit_all() {
     iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
 
   echo "✅ 已开启【全端口 1:1 转发】(排除 22)：O → A:任意 TCP 端口 ≈ O → B(${exit_ip}):同端口"
+}
+
+disable_full_port_forward_to_exit_all() {
+  local exit_ip
+  local wan_if
+
+  if [[ -f "$EXIT_WG_IP_FILE" ]]; then
+    exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
+  fi
+  [[ -z "$exit_ip" ]] && return 0
+
+  wan_if=$(get_wan_if)
+
+  # 删掉保护 22 的 RETURN
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport 22 -j RETURN 2>/dev/null || true
+
+  # 删掉「其它端口全部 DNAT 到 B」这条
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+
+  # 删掉 FORWARD 放行
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+
+  echo "✅ 已关闭【全端口 1:1 转发 A→B】规则。"
 }
 
 enable_global_mode() {
@@ -568,6 +620,10 @@ enable_global_mode() {
 
 enable_split_mode() {
   echo "[*] 切换为【端口分流模式】..."
+
+  # 退回分流时，先关掉全局模式下的全端口 1:1 转发
+  disable_full_port_forward_to_exit_all
+
   ensure_policy_routing_for_ports
   clear_mark_rules
   apply_port_rules_from_file
@@ -576,7 +632,7 @@ enable_split_mode() {
   ip link set dev ${WG_IF} mtu ${WG_SAFE_MTU} 2>/dev/null || true
 
   set_mode_flag "split"
-  echo "✅ 已切回【端口分流模式】，只有端口列表中源端口才走出口。"
+  echo "✅ 已切回【端口分流模式】，只有端口列表中目标端口才走出口。"
 }
 
 apply_current_mode() {
@@ -731,8 +787,8 @@ EOF
 manage_entry_ports() {
   echo "==== 入口服务器 端口分流管理 ===="
   echo "说明："
-  echo "  - 管的是【入口这台机器】本地源端口的分流规则；"
-  echo "  - 源端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
+  echo "  - 管的是【入口这台机器】本地和转发流量的目标端口分流规则；"
+  echo "  - 目标端口在列表中的所有 TCP/UDP 流量 → mark=0x1 → table100 → wg0 → 出口；"
   echo "  - 同时：从外部打到入口 A:该端口的 TCP，会转发到出口 B 的 WG 内网 IP:同端口；"
   echo "  - 其它端口流量 → 走入口自己的公网。"
   echo
