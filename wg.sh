@@ -913,6 +913,57 @@ uninstall_wg() {
   esac
 }
 
+
+get_udp2raw_entry_remote() {
+  local unit="/etc/systemd/system/udp2raw-entry.service"
+  [[ -f "$unit" ]] || return 1
+  # 输出：host port
+  local line r
+  line="$(grep -E '^ExecStart=' "$unit" | head -n1)"
+  r="$(echo "$line" | sed -n 's/.* -r \([^ ]\+\).*/\1/p')"
+  [[ -n "$r" ]] || return 1
+  echo "${r%%:*} ${r##*:}"
+}
+
+update_udp2raw_entry_remote_ip() {
+  if [[ "$(get_role)" != "entry" ]]; then
+    echo "❌ 当前不是入口服务器，此功能仅入口可用。"
+    return 1
+  fi
+
+  local unit="/etc/systemd/system/udp2raw-entry.service"
+  if [[ ! -f "$unit" ]]; then
+    echo "❌ 找不到 $unit，先执行一次“配置为入口服务器”。"
+    return 1
+  fi
+
+  local cur_ip cur_port
+  read -r cur_ip cur_port < <(get_udp2raw_entry_remote || echo "unknown ${UDP2RAW_DEFAULT_PORT}")
+
+  echo "==== 修改入口出口 IP ===="
+  echo "当前出口 IP：$cur_ip"
+  read -rp "请输入新的出口公网 IP: " new_ip
+
+  if ! is_ipv4 "$new_ip"; then
+    echo "❌ IP 不合法：$new_ip"
+    return 1
+  fi
+
+  cp -a "$unit" "${unit}.bak" 2>/dev/null || true
+
+  sed -i -E "s/( -r )[[:graph:]]+:[0-9]+/\1${new_ip}:${cur_port}/" "$unit"
+
+  echo "$new_ip" > /etc/wireguard/.exit_public_ip 2>/dev/null || true
+  mkdir -p "$UDP2RAW_WORKDIR" 2>/dev/null || true
+  echo "${new_ip}:${cur_port}" > "$UDP2RAW_REMOTE_FILE" 2>/dev/null || true
+
+  systemctl daemon-reload
+  systemctl restart udp2raw-entry.service
+
+  echo "✅ 已更新出口 IP：$new_ip"
+}
+
+
 while true; do
   echo
   echo "================ 📡 WG-Raw 一键脚本 ================"
@@ -925,6 +976,7 @@ while true; do
   echo "7) 卸载 WG-Raw"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
+  echo "10) 修改出口 IP"
   echo "0) 退出"
   echo "=================================================================="
   read -rp "请选择: " choice
@@ -951,6 +1003,7 @@ while true; do
         manage_entry_mode
       fi
       ;;
+    10) update_udp2raw_entry_remote_ip ;;
     0) exit 0 ;;
     *) echo "无效选项。" ;;
   esac
