@@ -901,6 +901,9 @@ uninstall_wg() {
             "$PORT_LIST_FILE" "$MODE_FILE" "$EXIT_WG_IP_FILE" "$ROLE_FILE" 2>/dev/null || true
       rmdir /etc/wireguard 2>/dev/null || true
 
+      apt remove -y wireguard wireguard-tools 2>/dev/null || true
+      apt autoremove -y 2>/dev/null || true
+
       echo "✅ WireGuard 与 udp2raw 已卸载，配置和端口分流规则已清理。"
       echo "✅ 正在删除当前脚本：$0"
       rm -f "$0" 2>/dev/null || true
