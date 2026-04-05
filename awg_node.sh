@@ -38,9 +38,7 @@ install_amneziawg() {
   fi
 
   echo "[*] 启动环境防御机制：执行焦土清理与时钟校准..."
-  # 物理抹除遗留的 PPA 幽灵源
   rm -f /etc/apt/sources.list.d/*amnezia*.list 2>/dev/null || true
-  # 强制抹平系统时间漂移，防御 GPG 签名报错
   date -s "$(curl -sI https://cloudflare.com | grep -i date | sed 's/^[Dd]ate: //')" 2>/dev/null || true
 
   export DEBIAN_FRONTEND=noninteractive
@@ -600,12 +598,16 @@ restart_wg() {
 }
 
 uninstall_wg() {
-  read -rp "确认彻底卸载并清理？(y/N): " confirm
+  read -rp "🚨 确认执行焦土级卸载？将彻底抹除所有二进制、内核模块及路由规则！(y/N): " confirm
   if [[ "$confirm" =~ ^[yY]$ ]]; then
+    echo "[*] 开始执行物理级深度大扫除..."
+
+    # 1. 停机并注销守护进程
     systemctl stop awg-quick@${AWG_IF}.service 2>/dev/null || true
     systemctl disable awg-quick@${AWG_IF}.service 2>/dev/null || true
     stop_wg
 
+    # 2. 清理分流端口注入规则
     if [[ -f "$PORT_LIST_FILE" ]]; then
       while read -r p; do
         [[ -z "$p" ]] && continue
@@ -615,10 +617,34 @@ uninstall_wg() {
       done < "$PORT_LIST_FILE"
     fi
 
-    rm -rf "${AWG_DIR}" /usr/local/src/awg_build 2>/dev/null || true
+    # 3. 暴力清洗防火墙与策略路由残留
+    echo "[*] 清洗 Netfilter 路由与防火墙残留..."
+    for table in nat mangle filter; do
+      iptables-save -t $table | grep -v "${AWG_IF}" | iptables-restore 2>/dev/null || true
+    done
+    ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
+    ip route flush table 100 2>/dev/null || true
+    ip link delete ${AWG_IF} 2>/dev/null || true
+
+    # 4. 从内核强行剥离模块
+    echo "[*] 正在从系统内核拔除 AmneziaWG 驱动..."
     modprobe -r amneziawg 2>/dev/null || true
-    
-    echo "✅ 清理完毕，正在自毁脚本。"
+    rm -f /lib/modules/$(uname -r)/extra/amneziawg.ko 2>/dev/null || true
+    depmod -a 2>/dev/null || true
+
+    # 5. 物理粉碎编译产出与配置核心
+    echo "[*] 正在物理销毁二进制可执行文件与目录痕迹..."
+    rm -rf "${AWG_DIR}" 2>/dev/null || true
+    rm -rf /usr/local/src/awg_build 2>/dev/null || true
+    rm -f /usr/bin/awg /usr/bin/awg-quick /usr/local/bin/awg /usr/local/bin/awg-quick 2>/dev/null || true
+    rm -f /usr/share/man/man8/awg.8 /usr/share/man/man8/awg-quick.8 2>/dev/null || true
+    rm -f /usr/share/bash-completion/completions/awg /usr/share/bash-completion/completions/awg-quick 2>/dev/null || true
+
+    # 6. 系统变量复位
+    sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
+    sysctl -p >/dev/null 2>&1 || true
+
+    echo "✅ 焦土清理完毕。系统已恢复至部署前的绝对纯净态。正在自毁脚本..."
     rm -f "$0" 2>/dev/null || true
     exit 0
   fi
@@ -642,7 +668,7 @@ while true; do
   echo "4) 启动"
   echo "5) 停止"
   echo "6) 重启"
-  echo "7) 卸载并清理"
+  echo "7) 卸载并彻底清理"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP"
