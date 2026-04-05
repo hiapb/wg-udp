@@ -25,29 +25,43 @@ set_role() {
 }
 
 if [[ $EUID -ne 0 ]]; then
-  echo "请用 root 运行这个脚本： sudo bash awg_node.sh"
+  echo "请用 root 运行这个脚本： sudo bash awg.sh"
   exit 1
 fi
 
 install_amneziawg() {
   echo "[*] 检查 AmneziaWG 及相关依赖..."
   if command -v awg-quick &>/dev/null && command -v awg &>/dev/null; then
-    echo "[*] AmneziaWG 已安装，跳过。"
+    echo "[*] AmneziaWG 已存在，跳过安装。"
     return
   fi
 
-  echo "[*] 正在配置 AmneziaWG 安装环境..."
+  echo "[*] 正在通过源码编译安装 AmneziaWG..."
   export DEBIAN_FRONTEND=noninteractive
   apt update
-  apt install -y software-properties-common curl iproute2 iptables jq
+  apt install -y build-essential git curl iproute2 iptables jq libmnl-dev linux-headers-$(uname -r)
 
-  if ! grep -q "amnezia/ppa" /etc/apt/sources.list /etc/apt/sources.list.d/* 2>/dev/null; then
-    add-apt-repository -y ppa:amnezia/ppa
-    apt update
-  fi
+  local WORKDIR="/usr/local/src/awg_build"
+  mkdir -p "$WORKDIR"
 
-  apt install -y amneziawg-tools amneziawg-dkms
-  echo "✅ AmneziaWG 内核模块与工具链已安装"
+  echo "[*] 正在编译 amneziawg.ko 内核模块..."
+  cd "$WORKDIR"
+  rm -rf amneziawg-linux-module
+  git clone https://github.com/amnezia-vpn/amneziawg-linux-module.git
+  cd amneziawg-linux-module/src
+  make module
+  make install
+  modprobe amneziawg || true
+
+  echo "[*] 正在编译 awg 工具链..."
+  cd "$WORKDIR"
+  rm -rf amneziawg-tools
+  git clone https://github.com/amnezia-vpn/amneziawg-tools.git
+  cd amneziawg-tools/src
+  make
+  make install
+
+  echo "✅ AmneziaWG 编译并安装完成"
 }
 
 detect_public_ip() {
@@ -62,7 +76,6 @@ detect_public_ip() {
 }
 
 generate_awg_params() {
-  # 动态生成 AWG 魔改抗审查参数
   JC=$((RANDOM % 10 + 3))
   JMIN=$((RANDOM % 30 + 20))
   JMAX=$((JMIN + RANDOM % 40 + 10))
@@ -81,12 +94,16 @@ configure_exit() {
 
   PUB_IP_DETECTED=$(detect_public_ip || true)
   if [[ -n "$PUB_IP_DETECTED" ]]; then
-    echo "[*] 检测到出口公网 IP：$PUB_IP_DETECTED"
+    echo "[*] 检测到出口服务器公网 IP：$PUB_IP_DETECTED"
     read -rp "出口服务器公网 IP (默认自动检测到的 IP): " EXIT_PUBLIC_IP
     EXIT_PUBLIC_IP=${EXIT_PUBLIC_IP:-$PUB_IP_DETECTED}
   else
+    echo "[*] 未能自动检测公网 IP，请手动输入。"
     read -rp "出口服务器公网 IP: " EXIT_PUBLIC_IP
   fi
+
+  echo "👉 最终使用的出口公网 IP：$EXIT_PUBLIC_IP"
+  echo
 
   read -rp "出口服务器 AWG 内网 IP (默认 10.0.0.1/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.1/24}
@@ -105,7 +122,7 @@ configure_exit() {
   cd /etc/amneziawg
 
   if [ ! -f exit_private.key ]; then
-    echo "[*] 生成底层加密密钥..."
+    echo "[*] 生成出口服务器密钥..."
     umask 077
     awg genkey | tee exit_private.key | awg pubkey > exit_public.key
   fi
@@ -116,8 +133,6 @@ configure_exit() {
   ENTRY_PUBLIC_KEY=${ENTRY_PUBLIC_KEY:-CHANGE_ME_ENTRY_PUBLIC_KEY}
 
   generate_awg_params
-  
-  # 打包参数供入口服务器导入，避免繁琐复制
   LINK_TOKEN=$(echo -n "${EXIT_PUBLIC_IP}|${LISTEN_PORT}|${EXIT_PUBLIC_KEY}|${JC}|${JMIN}|${JMAX}|${S1}|${S2}|${H1}|${H2}|${H3}|${H4}" | base64 -w 0)
 
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
@@ -135,7 +150,7 @@ ListenPort = ${LISTEN_PORT}
 PrivateKey = ${EXIT_PRIVATE_KEY}
 MTU = ${AWG_SAFE_MTU}
 
-# AmneziaWG 混淆参数 (核心抗封锁层)
+# AmneziaWG 混淆参数
 Jc = ${JC}
 Jmin = ${JMIN}
 Jmax = ${JMAX}
@@ -160,13 +175,11 @@ EOF
   awg-quick up ${AWG_IF}
 
   echo
-  echo "=========================================================="
-  echo "🚀 出口节点配置完成！请将以下 Link-Token 复制给【入口服务器】"
-  echo "包含：IP、端口、公钥及9个防封锁混淆参数"
-  echo "----------------------------------------------------------"
+  echo "====== 综合链路连接信息（给入口服务器用）======"
   echo "${LINK_TOKEN}"
-  echo "=========================================================="
+  echo "=============================================="
   echo
+  echo "出口服务器配置完成，当前状态："
   awg show || true
 }
 
@@ -277,7 +290,7 @@ add_forward_port_mapping() {
     exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
   fi
   if [[ -z "$exit_ip" ]]; then
-    echo "⚠ 未找到出口 AWG 内网 IP，跳过端口映射配置。"
+    echo "⚠ 未找到出口 WG 内网 IP，跳过端口映射配置。"
     return 0
   fi
 
@@ -326,7 +339,6 @@ enable_global_mode() {
     exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
   fi
 
-  # 获取对方真实监听端口防止路由死循环
   local AWG_REMOTE_PORT=$(grep "Endpoint" /etc/amneziawg/${AWG_IF}.conf 2>/dev/null | awk -F':' '{print $NF}')
   AWG_REMOTE_PORT=${AWG_REMOTE_PORT:-$AWG_DEFAULT_PORT}
 
@@ -351,7 +363,7 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
   iptables -t mangle -C OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
   
-  # 放行底层 AWG 传输端口
+  # 放行底层传输端口
   iptables -t mangle -C OUTPUT -p udp --dport "${AWG_REMOTE_PORT}" -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --dport "${AWG_REMOTE_PORT}" -j RETURN
 
@@ -442,20 +454,21 @@ configure_entry() {
   ENTRY_PRIVATE_KEY=$(cat entry_private.key)
   ENTRY_PUBLIC_KEY=$(cat entry_public.key)
 
-  echo "您的【入口服务器公钥】为: ${ENTRY_PUBLIC_KEY}"
-  echo "(请确保已将此公钥填入出口服务器)"
+  echo
+  echo "====== 入口服务器 公钥（出口服务器用）======"
+  echo "${ENTRY_PUBLIC_KEY}"
+  echo "================================================"
   echo
 
-  read -rp "请粘贴由出口服务器生成的 Link-Token (Base64格式): " TOKEN_B64
+  read -rp "请粘贴出口服务器生成的连接信息（Link-Token）: " TOKEN_B64
   TOKEN_DECODED=$(echo "$TOKEN_B64" | base64 -d 2>/dev/null || true)
   
   if [[ -z "$TOKEN_DECODED" || "$TOKEN_DECODED" != *"|"* ]]; then
-    echo "❌ Token 解析失败，请检查复制是否完整。"
+    echo "❌ 解析失败，请检查复制是否完整。"
     return
   fi
 
   IFS='|' read -r REMOTE_IP REMOTE_PORT EXIT_PUBKEY P_JC P_JMIN P_JMAX P_S1 P_S2 P_H1 P_H2 P_H3 P_H4 <<< "$TOKEN_DECODED"
-  echo "✅ 成功解析出口配置：IP=${REMOTE_IP}, 端口=${REMOTE_PORT}"
 
   read -rp "入口服务器 AWG 内网 IP (默认 10.0.0.2/24): " WG_ADDR
   WG_ADDR=${WG_ADDR:-10.0.0.2/24}
@@ -473,7 +486,7 @@ PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
 MTU = ${AWG_SAFE_MTU}
 
-# AmneziaWG 混淆参数 (需严格对称)
+# AmneziaWG 混淆参数
 Jc = ${P_JC}
 Jmin = ${P_JMIN}
 Jmax = ${P_JMAX}
@@ -505,7 +518,7 @@ EOF
   set_mode_flag "split"
   apply_current_mode
 
-  echo "✅ 入口服务器配置完成，当前状态："
+  echo "入口服务器配置完成，当前状态："
   awg show || true
 }
 
@@ -590,10 +603,9 @@ uninstall_wg() {
       done < "$PORT_LIST_FILE"
     fi
 
-    rm -rf /etc/amneziawg 2>/dev/null || true
-    apt remove -y amneziawg-tools amneziawg-dkms 2>/dev/null || true
-    apt autoremove -y 2>/dev/null || true
-
+    rm -rf /etc/amneziawg /usr/local/src/awg_build 2>/dev/null || true
+    modprobe -r amneziawg 2>/dev/null || true
+    
     echo "✅ 清理完毕，正在自毁脚本。"
     rm -f "$0" 2>/dev/null || true
     exit 0
@@ -606,12 +618,12 @@ update_entry_remote_ip() {
   read -rp "新出口公网 IP: " new_ip
   sed -i -E "s/Endpoint = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/Endpoint = ${new_ip}/" "$conf"
   restart_wg
-  echo "✅ IP 已更新为 $new_ip 并已重启底层隧道"
+  echo "✅ IP 已更新为 $new_ip"
 }
 
 while true; do
   echo
-  echo "================ 📡 AmneziaWG L3 高级链路 ================"
+  echo "================ 📡 AWG 高级链路 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看链路状态"
@@ -623,7 +635,7 @@ while true; do
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP"
   echo "0) 退出"
-  echo "=========================================================="
+  echo "================================================="
   read -rp "请选择: " choice
 
   case "$choice" in
