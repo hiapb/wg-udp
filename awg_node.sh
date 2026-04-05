@@ -2,10 +2,11 @@
 set -e
 
 AWG_IF="awg0"
-PORT_LIST_FILE="/etc/amneziawg/.awg_ports"
-MODE_FILE="/etc/amneziawg/.awg_mode"
-EXIT_WG_IP_FILE="/etc/amneziawg/.exit_awg_ip"
-ROLE_FILE="/etc/amneziawg/.awg_role"
+AWG_DIR="/etc/amnezia/amneziawg"
+PORT_LIST_FILE="${AWG_DIR}/.awg_ports"
+MODE_FILE="${AWG_DIR}/.awg_mode"
+EXIT_WG_IP_FILE="${AWG_DIR}/.exit_awg_ip"
+ROLE_FILE="${AWG_DIR}/.awg_role"
 
 AWG_SAFE_MTU=1320
 AWG_DEFAULT_PORT=51820
@@ -36,14 +37,24 @@ install_amneziawg() {
     return
   fi
 
-  echo "[*] 正在通过源码编译安装 AmneziaWG..."
+  echo "[*] 启动环境防御机制：执行焦土清理与时钟校准..."
+  # 物理抹除遗留的 PPA 幽灵源
+  rm -f /etc/apt/sources.list.d/*amnezia*.list 2>/dev/null || true
+  # 强制抹平系统时间漂移，防御 GPG 签名报错
+  date -s "$(curl -sI https://cloudflare.com | grep -i date | sed 's/^[Dd]ate: //')" 2>/dev/null || true
+
   export DEBIAN_FRONTEND=noninteractive
   apt update
+
+  echo "[*] 正在安装底层 C 语言核心编译链..."
   apt install -y build-essential git curl iproute2 iptables jq libmnl-dev linux-headers-$(uname -r)
+  
+  echo "[*] 正在执行云主机阉割环境补丁：强制重装编译器底层组件..."
+  apt install --reinstall -y gcc g++ libc6-dev build-essential 2>/dev/null || true
 
   local WORKDIR="/usr/local/src/awg_build"
   
-  echo "[*] 正在清理底层构建环境的脏数据..."
+  echo "[*] 正在清理构建目录的脏数据..."
   rm -rf "$WORKDIR"
   mkdir -p "$WORKDIR"
 
@@ -119,8 +130,8 @@ configure_exit() {
   read -rp "隧道监听端口 (默认 ${AWG_DEFAULT_PORT}): " LISTEN_PORT
   LISTEN_PORT=${LISTEN_PORT:-$AWG_DEFAULT_PORT}
 
-  mkdir -p /etc/amneziawg
-  cd /etc/amneziawg
+  mkdir -p "${AWG_DIR}"
+  cd "${AWG_DIR}"
 
   if [ ! -f exit_private.key ]; then
     echo "[*] 生成出口服务器密钥..."
@@ -144,7 +155,7 @@ configure_exit() {
   iptables -t nat -C POSTROUTING -s 10.0.0.0/24 -o "${OUT_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -s 10.0.0.0/24 -o "${OUT_IF}" -j MASQUERADE
 
-  cat > /etc/amneziawg/${AWG_IF}.conf <<EOF
+  cat > "${AWG_DIR}/${AWG_IF}.conf" <<EOF
 [Interface]
 Address = ${WG_ADDR}
 ListenPort = ${LISTEN_PORT}
@@ -170,7 +181,7 @@ PublicKey = ${ENTRY_PUBLIC_KEY}
 AllowedIPs = ${ENTRY_WG_IP}
 EOF
 
-  chmod 600 /etc/amneziawg/${AWG_IF}.conf
+  chmod 600 "${AWG_DIR}/${AWG_IF}.conf"
   systemctl enable awg-quick@${AWG_IF}.service >/dev/null 2>&1 || true
   awg-quick down ${AWG_IF} 2>/dev/null || true
   awg-quick up ${AWG_IF}
@@ -340,7 +351,7 @@ enable_global_mode() {
     exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
   fi
 
-  local AWG_REMOTE_PORT=$(grep "Endpoint" /etc/amneziawg/${AWG_IF}.conf 2>/dev/null | awk -F':' '{print $NF}')
+  local AWG_REMOTE_PORT=$(grep "Endpoint" "${AWG_DIR}/${AWG_IF}.conf" 2>/dev/null | awk -F':' '{print $NF}')
   AWG_REMOTE_PORT=${AWG_REMOTE_PORT:-$AWG_DEFAULT_PORT}
 
   enable_ip_forward_global
@@ -444,8 +455,8 @@ configure_entry() {
   set_role "entry"
   install_amneziawg
 
-  mkdir -p /etc/amneziawg
-  cd /etc/amneziawg
+  mkdir -p "${AWG_DIR}"
+  cd "${AWG_DIR}"
 
   if [ ! -f entry_private.key ]; then
     echo "[*] 生成入口服务器密钥..."
@@ -480,7 +491,7 @@ configure_entry() {
   EXIT_WG_IP_NO_MASK="${EXIT_WG_IP%%/*}"
   echo "$EXIT_WG_IP_NO_MASK" > "$EXIT_WG_IP_FILE"
 
-  cat > /etc/amneziawg/${AWG_IF}.conf <<EOF
+  cat > "${AWG_DIR}/${AWG_IF}.conf" <<EOF
 [Interface]
 Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
@@ -508,7 +519,7 @@ AllowedIPs = 0.0.0.0/0
 PersistentKeepalive = 25
 EOF
 
-  chmod 600 /etc/amneziawg/${AWG_IF}.conf
+  chmod 600 "${AWG_DIR}/${AWG_IF}.conf"
 
   systemctl enable awg-quick@${AWG_IF}.service >/dev/null 2>&1 || true
   awg-quick down ${AWG_IF} 2>/dev/null || true
@@ -604,7 +615,7 @@ uninstall_wg() {
       done < "$PORT_LIST_FILE"
     fi
 
-    rm -rf /etc/amneziawg /usr/local/src/awg_build 2>/dev/null || true
+    rm -rf "${AWG_DIR}" /usr/local/src/awg_build 2>/dev/null || true
     modprobe -r amneziawg 2>/dev/null || true
     
     echo "✅ 清理完毕，正在自毁脚本。"
@@ -614,7 +625,7 @@ uninstall_wg() {
 }
 
 update_entry_remote_ip() {
-  local conf="/etc/amneziawg/${AWG_IF}.conf"
+  local conf="${AWG_DIR}/${AWG_IF}.conf"
   [[ -f "$conf" ]] || return 1
   read -rp "新出口公网 IP: " new_ip
   sed -i -E "s/Endpoint = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/Endpoint = ${new_ip}/" "$conf"
