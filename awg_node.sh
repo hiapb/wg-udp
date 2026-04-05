@@ -37,21 +37,56 @@ install_amneziawg() {
     return
   fi
 
-  echo "[*] 启动环境防御机制：执行焦土清理..."
+  echo "[*] 执行环境清理..."
   rm -f /etc/apt/sources.list.d/*amnezia*.list 2>/dev/null || true
 
   export DEBIAN_FRONTEND=noninteractive
   apt update
 
-  echo "[*] 正在安装底层 C 语言核心编译链..."
-  apt install -y build-essential git curl iproute2 iptables jq libmnl-dev linux-headers-$(uname -r)
+  echo "[*] 正在安装编译依赖..."
+  apt install -y \
+    build-essential \
+    gcc \
+    g++ \
+    cpp \
+    libc6-dev \
+    libgcc-s1 \
+    libstdc++6 \
+    binutils \
+    git \
+    curl \
+    iproute2 \
+    iptables \
+    jq \
+    libmnl-dev \
+    linux-headers-$(uname -r)
 
-  echo "[*] 正在执行云主机阉割环境补丁：强制重装编译器底层组件..."
-  apt install --reinstall -y gcc g++ libc6-dev build-essential 2>/dev/null || true
+  echo "[*] 正在重装关键编译组件..."
+  apt install --reinstall -y \
+    build-essential \
+    gcc \
+    g++ \
+    cpp \
+    libc6-dev \
+    libgcc-s1 \
+    libstdc++6 \
+    binutils 2>/dev/null || true
+
+  local GCC_MAJOR=""
+  GCC_MAJOR="$(gcc -dumpversion 2>/dev/null | cut -d. -f1 || true)"
+  if [[ -n "$GCC_MAJOR" ]]; then
+    apt install --reinstall -y "gcc-${GCC_MAJOR}" "libgcc-${GCC_MAJOR}-dev" 2>/dev/null || true
+  fi
+
+  echo "[*] 检查 libgcc 路径..."
+  if ! gcc -print-libgcc-file-name >/dev/null 2>&1; then
+    echo "❌ 当前系统 gcc/libgcc 环境异常，无法定位 libgcc。"
+    exit 1
+  fi
 
   local WORKDIR="/usr/local/src/awg_build"
 
-  echo "[*] 正在清理构建目录的脏数据..."
+  echo "[*] 正在清理构建目录..."
   rm -rf "$WORKDIR"
   mkdir -p "$WORKDIR"
 
@@ -67,6 +102,7 @@ install_amneziawg() {
   cd "$WORKDIR"
   git clone https://github.com/amnezia-vpn/amneziawg-tools.git
   cd amneziawg-tools/src
+  make clean 2>/dev/null || true
   make
   make install
 
@@ -161,8 +197,6 @@ Address = ${WG_ADDR}
 ListenPort = ${LISTEN_PORT}
 PrivateKey = ${EXIT_PRIVATE_KEY}
 MTU = ${AWG_SAFE_MTU}
-
-# AmneziaWG 混淆参数
 Jc = ${JC}
 Jmin = ${JMIN}
 Jmax = ${JMAX}
@@ -519,8 +553,6 @@ Address = ${WG_ADDR}
 PrivateKey = ${ENTRY_PRIVATE_KEY}
 Table = off
 MTU = ${AWG_SAFE_MTU}
-
-# AmneziaWG 混淆参数
 Jc = ${P_JC}
 Jmin = ${P_JMIN}
 Jmax = ${P_JMAX}
@@ -615,6 +647,9 @@ start_wg() {
 
 stop_wg() {
   echo "[*] 停止链路..."
+  if [[ "$(get_current_mode)" == "global" ]]; then
+    enable_split_mode >/dev/null 2>&1 || true
+  fi
   awg-quick down ${AWG_IF} 2>/dev/null || true
   ip route flush table 100 2>/dev/null || true
   clear_mark_rules
