@@ -42,20 +42,21 @@ install_amneziawg() {
   apt install -y build-essential git curl iproute2 iptables jq libmnl-dev linux-headers-$(uname -r)
 
   local WORKDIR="/usr/local/src/awg_build"
+  
+  echo "[*] 正在清理底层构建环境的脏数据..."
+  rm -rf "$WORKDIR"
   mkdir -p "$WORKDIR"
 
   echo "[*] 正在编译 amneziawg.ko 内核模块..."
   cd "$WORKDIR"
-  rm -rf amneziawg-linux-module
-  git clone https://github.com/amnezia-vpn/amneziawg-linux-module.git
-  cd amneziawg-linux-module/src
+  git clone https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git
+  cd amneziawg-linux-kernel-module/src
   make module
   make install
   modprobe amneziawg || true
 
   echo "[*] 正在编译 awg 工具链..."
   cd "$WORKDIR"
-  rm -rf amneziawg-tools
   git clone https://github.com/amnezia-vpn/amneziawg-tools.git
   cd amneziawg-tools/src
   make
