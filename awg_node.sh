@@ -37,21 +37,20 @@ install_amneziawg() {
     return
   fi
 
-  echo "[*] 启动环境防御机制：执行焦土清理与时钟校准..."
+  echo "[*] 启动环境防御机制：执行焦土清理..."
   rm -f /etc/apt/sources.list.d/*amnezia*.list 2>/dev/null || true
-  date -s "$(curl -sI https://cloudflare.com | grep -i date | sed 's/^[Dd]ate: //')" 2>/dev/null || true
 
   export DEBIAN_FRONTEND=noninteractive
   apt update
 
   echo "[*] 正在安装底层 C 语言核心编译链..."
   apt install -y build-essential git curl iproute2 iptables jq libmnl-dev linux-headers-$(uname -r)
-  
+
   echo "[*] 正在执行云主机阉割环境补丁：强制重装编译器底层组件..."
   apt install --reinstall -y gcc g++ libc6-dev build-essential 2>/dev/null || true
 
   local WORKDIR="/usr/local/src/awg_build"
-  
+
   echo "[*] 正在清理构建目录的脏数据..."
   rm -rf "$WORKDIR"
   mkdir -p "$WORKDIR"
@@ -70,6 +69,9 @@ install_amneziawg() {
   cd amneziawg-tools/src
   make
   make install
+
+  command -v awg >/dev/null 2>&1 || { echo "❌ awg 安装失败"; exit 1; }
+  command -v awg-quick >/dev/null 2>&1 || { echo "❌ awg-quick 安装失败"; exit 1; }
 
   echo "✅ AmneziaWG 编译并安装完成"
 }
@@ -204,12 +206,33 @@ ensure_policy_routing_for_ports() {
 }
 
 clear_mark_rules() {
-  for chain in OUTPUT PREROUTING; do
-    iptables -t mangle -S "$chain" 2>/dev/null | grep " MARK " \
-      | sed 's/^-A /-D /' | while read -r line; do
-          iptables -t mangle $line 2>/dev/null || true
-        done
-  done
+  local wan_if awg_remote_port
+  wan_if=$(get_wan_if)
+
+  iptables -t mangle -D OUTPUT -o lo -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || true
+
+  awg_remote_port=$(grep "Endpoint" "${AWG_DIR}/${AWG_IF}.conf" 2>/dev/null | awk -F':' '{print $NF}' | tail -n1)
+  awg_remote_port=${awg_remote_port:-$AWG_DEFAULT_PORT}
+  iptables -t mangle -D OUTPUT -p udp --dport "${awg_remote_port}" -j RETURN 2>/dev/null || true
+
+  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1 2>/dev/null || true
+
+  if [[ -f "$PORT_LIST_FILE" ]]; then
+    while read -r p; do
+      [[ -z "$p" ]] && continue
+      [[ "$p" =~ ^# ]] && continue
+
+      iptables -t mangle -D OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+    done < "$PORT_LIST_FILE"
+  fi
 }
 
 apply_port_rules_from_file() {
@@ -310,13 +333,13 @@ add_forward_port_mapping() {
   ip route replace "${exit_ip}/32" dev "${AWG_IF}"
 
   iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || \
-  iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
 
   iptables -C FORWARD -i "${wan_if}" -o "${AWG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -i "${wan_if}" -o "${AWG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -i "${wan_if}" -o "${AWG_IF}" -p tcp --dport "${port}" -m state --state NEW,ESTABLISHED,RELATED -j ACCEPT
 
   iptables -C FORWARD -i "${AWG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-  iptables -A FORWARD -i "${AWG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
+    iptables -A FORWARD -i "${AWG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m state --state ESTABLISHED,RELATED -j ACCEPT
 
   iptables -t nat -C POSTROUTING -o "${AWG_IF}" -j MASQUERADE 2>/dev/null || \
     iptables -t nat -A POSTROUTING -o "${AWG_IF}" -j MASQUERADE
@@ -349,7 +372,8 @@ enable_global_mode() {
     exit_ip=$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)
   fi
 
-  local AWG_REMOTE_PORT=$(grep "Endpoint" "${AWG_DIR}/${AWG_IF}.conf" 2>/dev/null | awk -F':' '{print $NF}')
+  local AWG_REMOTE_PORT
+  AWG_REMOTE_PORT=$(grep "Endpoint" "${AWG_DIR}/${AWG_IF}.conf" 2>/dev/null | awk -F':' '{print $NF}' | tail -n1)
   AWG_REMOTE_PORT=${AWG_REMOTE_PORT:-$AWG_DEFAULT_PORT}
 
   enable_ip_forward_global
@@ -357,13 +381,13 @@ enable_global_mode() {
   if [[ -n "$exit_ip" ]]; then
     ip route replace "${exit_ip}/32" dev "${AWG_IF}" 2>/dev/null || true
     iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
+      iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
     iptables -t nat -C PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || \
-    iptables -t nat -A PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
+      iptables -t nat -A PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
     iptables -C FORWARD -i "${wan_if}" -o "${AWG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${wan_if}" -o "${AWG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+      iptables -A FORWARD -i "${wan_if}" -o "${AWG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
     iptables -C FORWARD -i "${AWG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || \
-    iptables -A FORWARD -i "${AWG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+      iptables -A FORWARD -i "${AWG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -t nat -C POSTROUTING -o "${AWG_IF}" -j MASQUERADE 2>/dev/null || \
       iptables -t nat -A POSTROUTING -o "${AWG_IF}" -j MASQUERADE
   fi
@@ -372,8 +396,6 @@ enable_global_mode() {
   iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
   iptables -t mangle -C OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
   iptables -t mangle -C OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
-  
-  # 放行底层传输端口
   iptables -t mangle -C OUTPUT -p udp --dport "${AWG_REMOTE_PORT}" -j RETURN 2>/dev/null || \
     iptables -t mangle -A OUTPUT -p udp --dport "${AWG_REMOTE_PORT}" -j RETURN
 
@@ -422,7 +444,8 @@ enable_split_mode() {
 }
 
 apply_current_mode() {
-  local mode=$(get_current_mode)
+  local mode
+  mode=$(get_current_mode)
   if [[ "$mode" == "global" ]]; then
     enable_global_mode
   else
@@ -433,7 +456,8 @@ apply_current_mode() {
 manage_entry_mode() {
   echo "==== 入口服务器 模式切换 ===="
   while true; do
-    local mode=$(get_current_mode)
+    local mode
+    mode=$(get_current_mode)
     echo "当前模式：$mode"
     echo "1) 切换为【全局模式】"
     echo "2) 切换为【端口分流模式】"
@@ -472,7 +496,7 @@ configure_entry() {
 
   read -rp "请粘贴出口服务器生成的连接信息（Link-Token）: " TOKEN_B64
   TOKEN_DECODED=$(echo "$TOKEN_B64" | base64 -d 2>/dev/null || true)
-  
+
   if [[ -z "$TOKEN_DECODED" || "$TOKEN_DECODED" != *"|"* ]]; then
     echo "❌ 解析失败，请检查复制是否完整。"
     return
@@ -581,8 +605,12 @@ show_status() {
 
 start_wg() {
   echo "[*] 启动链路..."
-  awg-quick up ${AWG_IF} || true
-  apply_current_mode
+  if awg-quick up "${AWG_IF}"; then
+    apply_current_mode
+  else
+    echo "❌ AWG 启动失败，未应用模式规则。"
+    return 1
+  fi
 }
 
 stop_wg() {
@@ -602,12 +630,10 @@ uninstall_wg() {
   if [[ "$confirm" =~ ^[yY]$ ]]; then
     echo "[*] 开始执行物理级深度大扫除..."
 
-    # 1. 停机并注销守护进程
     systemctl stop awg-quick@${AWG_IF}.service 2>/dev/null || true
     systemctl disable awg-quick@${AWG_IF}.service 2>/dev/null || true
     stop_wg
 
-    # 2. 清理分流端口注入规则
     if [[ -f "$PORT_LIST_FILE" ]]; then
       while read -r p; do
         [[ -z "$p" ]] && continue
@@ -617,22 +643,16 @@ uninstall_wg() {
       done < "$PORT_LIST_FILE"
     fi
 
-    # 3. 暴力清洗防火墙与策略路由残留
     echo "[*] 清洗 Netfilter 路由与防火墙残留..."
-    for table in nat mangle filter; do
-      iptables-save -t $table | grep -v "${AWG_IF}" | iptables-restore 2>/dev/null || true
-    done
     ip rule del fwmark 0x1 lookup 100 2>/dev/null || true
     ip route flush table 100 2>/dev/null || true
     ip link delete ${AWG_IF} 2>/dev/null || true
 
-    # 4. 从内核强行剥离模块
     echo "[*] 正在从系统内核拔除 AmneziaWG 驱动..."
     modprobe -r amneziawg 2>/dev/null || true
     rm -f /lib/modules/$(uname -r)/extra/amneziawg.ko 2>/dev/null || true
     depmod -a 2>/dev/null || true
 
-    # 5. 物理粉碎编译产出与配置核心
     echo "[*] 正在物理销毁二进制可执行文件与目录痕迹..."
     rm -rf "${AWG_DIR}" 2>/dev/null || true
     rm -rf /usr/local/src/awg_build 2>/dev/null || true
@@ -640,7 +660,6 @@ uninstall_wg() {
     rm -f /usr/share/man/man8/awg.8 /usr/share/man/man8/awg-quick.8 2>/dev/null || true
     rm -f /usr/share/bash-completion/completions/awg /usr/share/bash-completion/completions/awg-quick 2>/dev/null || true
 
-    # 6. 系统变量复位
     sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
     sysctl -p >/dev/null 2>&1 || true
 
@@ -654,7 +673,7 @@ update_entry_remote_ip() {
   local conf="${AWG_DIR}/${AWG_IF}.conf"
   [[ -f "$conf" ]] || return 1
   read -rp "新出口公网 IP: " new_ip
-  sed -i -E "s/Endpoint = [0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/Endpoint = ${new_ip}/" "$conf"
+  sed -i -E "s#^(Endpoint = )[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+(:[0-9]+)#\1${new_ip}\2#" "$conf"
   restart_wg
   echo "✅ IP 已更新为 $new_ip"
 }
