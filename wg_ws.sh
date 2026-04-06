@@ -245,86 +245,206 @@ write_nginx_https_wstunnel_site() {
     https_redirect_target="https://\$host:${https_port}\$request_uri"
   fi
 
+  # ==========================================
+
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Global Network Speed Test</title>
+<title>Nexus Enterprise | Secure Gateway</title>
 <style>
-    :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9; --text-muted: #8b949e; --primary: #58a6ff; --success: #238636; --success-hover: #2ea043; }
-    * { box-sizing: border-box; margin: 0; padding: 0; }
-    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; }
-    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 40px; width: 100%; max-width: 480px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); text-align: center; }
-    h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; color: #fff; }
-    p.desc { font-size: 14px; color: var(--text-muted); margin-bottom: 32px; }
-    .progress-track { width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-bottom: 32px; display: none; }
-    .progress-fill { width: 0%; height: 100%; background: var(--primary); transition: width 0.1s linear; }
-    .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px; }
-    .metric-box { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 8px; padding: 16px 8px; }
-    .metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); display: block; margin-bottom: 8px; }
-    .metric-value { font-size: 20px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; }
-    .metric-unit { font-size: 12px; font-weight: 400; color: var(--text-muted); }
-    .btn { background: var(--success); color: #fff; border: none; width: 100%; padding: 14px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
-    .btn:hover { background: var(--success-hover); }
-    .btn:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
+  :root {
+    --bg-main: #0b0f19;
+    --bg-panel: #111827;
+    --text-primary: #f3f4f6;
+    --text-muted: #9ca3af;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --error: #ef4444;
+    --success: #10b981;
+    --border: #374151;
+  }
+  
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  
+  body { 
+    background-color: var(--bg-main); 
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+    color: var(--text-primary);
+    display: flex; 
+    justify-content: center; 
+    align-items: center; 
+    min-height: 100vh;
+    background-image: radial-gradient(circle at 50% 0%, #1f2937 0%, transparent 50%);
+  }
+
+  .gateway-container {
+    background: var(--bg-panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    width: 100%;
+    max-width: 420px;
+    padding: 40px;
+    box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5);
+    position: relative;
+    overflow: hidden;
+  }
+
+  .gateway-container::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0; height: 4px;
+    background: linear-gradient(90deg, var(--accent), #8b5cf6);
+  }
+
+  .header { text-align: center; margin-bottom: 32px; }
+  .header svg { width: 48px; height: 48px; margin-bottom: 16px; color: var(--accent); }
+  .header h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.025em; }
+  .header p { color: var(--text-muted); font-size: 14px; margin-top: 8px; }
+
+  .form-group { margin-bottom: 24px; text-align: left; }
+  .form-group label { display: block; font-size: 13px; font-weight: 500; color: var(--text-muted); margin-bottom: 8px; text-transform: uppercase; letter-spacing: 0.05em; }
+  .form-group input { 
+    width: 100%; padding: 12px 16px; 
+    background: #1f2937; border: 1px solid var(--border); 
+    border-radius: 8px; color: #fff; font-size: 15px; 
+    transition: all 0.2s ease;
+  }
+  .form-group input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(59, 130, 246, 0.2); }
+  
+  button { 
+    width: 100%; padding: 14px; 
+    background: var(--accent); color: #fff; 
+    border: none; border-radius: 8px; 
+    font-size: 15px; font-weight: 600; 
+    cursor: pointer; transition: background 0.2s, transform 0.1s;
+    display: flex; justify-content: center; align-items: center; gap: 8px;
+  }
+  button:hover:not(:disabled) { background: var(--accent-hover); }
+  button:active:not(:disabled) { transform: scale(0.98); }
+  button:disabled { background: #374151; color: var(--text-muted); cursor: not-allowed; }
+
+  .terminal {
+    margin-top: 24px;
+    background: #000;
+    border-radius: 6px;
+    padding: 12px;
+    font-family: 'JetBrains Mono', 'Courier New', Courier, monospace;
+    font-size: 12px;
+    color: var(--success);
+    height: 100px;
+    overflow-y: hidden;
+    display: none;
+    border: 1px solid var(--border);
+  }
+  .terminal-line { margin-bottom: 4px; opacity: 0; animation: fadeIn 0.3s forwards; }
+  .terminal-line.err { color: var(--error); }
+  .terminal-line.warn { color: #f59e0b; }
+  
+  @keyframes fadeIn { to { opacity: 1; } }
+
+  .loader {
+    width: 16px; height: 16px;
+    border: 2px solid rgba(255,255,255,0.3);
+    border-radius: 50%;
+    border-top-color: #fff;
+    animation: spin 1s ease-in-out infinite;
+    display: none;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .footer { margin-top: 32px; font-size: 12px; color: #4b5563; text-align: center; }
 </style>
 </head>
 <body>
-<div class="card">
-    <h1>Edge Speed Test</h1>
-    <p class="desc">Verify connection quality to the nearest edge node.</p>
-    
-    <div class="progress-track" id="pb"><div class="progress-fill" id="pf"></div></div>
-    
-    <div class="metrics-grid">
-        <div class="metric-box">
-            <span class="metric-label">Ping</span>
-            <span class="metric-value" id="ping">--</span> <span class="metric-unit">ms</span>
-        </div>
-        <div class="metric-box">
-            <span class="metric-label">Download</span>
-            <span class="metric-value" id="dl">--</span> <span class="metric-unit">Mbps</span>
-        </div>
-        <div class="metric-box">
-            <span class="metric-label">Upload</span>
-            <span class="metric-value" id="ul">--</span> <span class="metric-unit">Mbps</span>
-        </div>
-    </div>
-    
-    <button class="btn" id="startBtn" onclick="runDiagnostics()">Start Diagnostics</button>
+
+<div class="gateway-container">
+  <div class="header">
+    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 002-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10"></path>
+    </svg>
+    <h1>Nexus Workspace</h1>
+    <p>Secure Virtual Desktop Infrastructure</p>
+  </div>
+
+  <div class="form-group">
+    <label for="nodeId">Target Node / VDI Instance</label>
+    <input type="text" id="nodeId" placeholder="e.g. vdi-core-us-east" autocomplete="off" spellcheck="false">
+  </div>
+  
+  <div class="form-group">
+    <label for="token">Authentication Token</label>
+    <input type="password" id="token" placeholder="Enter strictly provisioned JWT">
+  </div>
+
+  <button id="connectBtn" onclick="initiateConnection()">
+    <div class="loader" id="btnLoader"></div>
+    <span id="btnText">Initialize Tunnel</span>
+  </button>
+
+  <div class="terminal" id="terminal"></div>
+
+  <div class="footer">
+    Protected by Nexus Zero-Trust Architecture &copy; 2026
+  </div>
 </div>
 
 <script>
-function runDiagnostics() {
-    const btn = document.getElementById('startBtn');
-    const pb = document.getElementById('pb');
-    const pf = document.getElementById('pf');
-    const els = { ping: document.getElementById('ping'), dl: document.getElementById('dl'), ul: document.getElementById('ul') };
+  function appendLog(msg, type = 'info') {
+    const term = document.getElementById('terminal');
+    const line = document.createElement('div');
+    line.className = 'terminal-line ' + (type === 'info' ? '' : type);
     
+    const time = new Date().toISOString().split('T')[1].substring(0, 8);
+    line.innerText = `[${time}] ${msg}`;
+    
+    term.appendChild(line);
+    term.scrollTop = term.scrollHeight;
+  }
+
+  function initiateConnection() {
+    const node = document.getElementById('nodeId').value.trim();
+    const token = document.getElementById('token').value.trim();
+    const btn = document.getElementById('connectBtn');
+    const term = document.getElementById('terminal');
+    
+    term.style.display = 'block';
+    term.innerHTML = '';
+
+    if(!node || !token) {
+      appendLog('AUTH_FAILURE: Missing instance ID or JWT token.', 'err');
+      return;
+    }
+
     btn.disabled = true;
-    btn.innerText = 'Analyzing...';
-    Object.values(els).forEach(e => e.innerText = '--');
-    pb.style.display = 'block';
+    document.getElementById('btnText').innerText = 'Negotiating...';
+    document.getElementById('btnLoader').style.display = 'block';
+
+    appendLog('Resolving edge location for ' + node + '...');
     
-    let tick = 0;
-    const timer = setInterval(() => {
-        tick++;
-        pf.style.width = tick + '%';
+    setTimeout(() => {
+      appendLog('Edge resolved. Establishing WSS tunnel...');
+      
+      setTimeout(() => {
+        appendLog('Handshake initiated. Generating ICE candidates...');
         
-        if (tick === 15) els.ping.innerText = (Math.random() * 15 + 8).toFixed(1);
-        if (tick > 15 && tick < 55) els.dl.innerText = (Math.random() * 80 + 150).toFixed(1);
-        if (tick > 55 && tick < 95) els.ul.innerText = (Math.random() * 40 + 60).toFixed(1);
-        
-        if (tick >= 100) {
-            clearInterval(timer);
+        setTimeout(() => {
+          appendLog('WARN: High latency detected on relay.', 'warn');
+          
+          setTimeout(() => {
+            appendLog('FATAL: Code 401 Unauthorized. Token expired or invalid signature.', 'err');
+            appendLog('Connection terminated by remote host.', 'err');
+            
             btn.disabled = false;
-            btn.innerText = 'Run Again';
-            setTimeout(() => pb.style.display = 'none', 500);
-        }
-    }, 40);
-}
+            document.getElementById('btnText').innerText = 'Initialize Tunnel';
+            document.getElementById('btnLoader').style.display = 'none';
+          }, 1200);
+        }, 1500);
+      }, 1000);
+    }, 800);
+  }
 </script>
 </body>
 </html>
@@ -333,6 +453,9 @@ EOF
   {
     echo "User-agent: *"
     echo "Disallow: /admin/"
+    echo "Disallow: /ws/"
+    echo "Disallow: /api/"
+    echo "Disallow: /vdi/"
     echo "Disallow: /${path_prefix}"
   } > "$web_root/robots.txt"
 
@@ -896,75 +1019,15 @@ update_wstunnel_entry_remote_ip() {
 }
 
 renew_cert_now() {
-  print_block "⏳ 正在手动续期证书"
-  install_base_packages
-  certbot renew --nginx >/dev/null 2>&1 || true
-  nginx -t >/dev/null && systemctl reload nginx
-  print_ok "证书续期执行完成"
-}
-
-manage_certificates() {
   if [[ "$(get_role)" != "exit" ]]; then
     print_err "仅出口服务器可用"
     return
   fi
-
-  local domain=""
-  if [[ -f "$WST_DOMAIN_FILE" ]]; then
-    domain="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
-  fi
-
-  while true; do
-    print_block "证书管理（仅出口）"
-    echo "当前绑定域名: ${domain:-未配置}"
-    echo "1) 查看证书情况"
-    echo "2) 开启自动续签"
-    echo "3) 关闭自动续签"
-    echo "4) 手动立即续签"
-    echo "5) 删除证书"
-    echo "0) 返回上一级"
-    read -rp "请选择: " sub
-
-    case "$sub" in
-      1)
-        if [[ -n "$domain" ]] && [[ -d "/etc/letsencrypt/live/${domain}" ]]; then
-          echo "✅ 检测到 ${domain} 的有效证书信息："
-          certbot certificates -d "$domain" 2>/dev/null | grep -E "Expiry Date|Certificate Path|Private Key Path" || true
-        else
-          print_warn "未检测到有效证书"
-        fi
-        ;;
-      2)
-        systemctl enable certbot.timer >/dev/null 2>&1 || true
-        systemctl start certbot.timer >/dev/null 2>&1 || true
-        print_ok "已开启自动续签定时任务 (certbot.timer)"
-        ;;
-      3)
-        systemctl disable certbot.timer >/dev/null 2>&1 || true
-        systemctl stop certbot.timer >/dev/null 2>&1 || true
-        print_ok "已关闭自动续签定时任务 (certbot.timer)"
-        ;;
-      4)
-        renew_cert_now
-        ;;
-      5)
-        if [[ -n "$domain" ]]; then
-          read -rp "⚠️ 确定要删除 ${domain} 的证书吗？会导致服务中断 (y/N): " confirm
-          if [[ "$confirm" =~ ^[Yy]$ ]]; then
-            certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
-            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
-            print_ok "证书已成功删除"
-          else
-            echo "已取消删除操作"
-          fi
-        else
-          print_warn "未找到绑定的域名，无法删除"
-        fi
-        ;;
-      0) break ;;
-      *) print_err "无效选择" ;;
-    esac
-  done
+  print_block "⏳ 正在续期证书"
+  install_base_packages
+  certbot renew --nginx >/dev/null 2>&1 || true
+  nginx -t >/dev/null && systemctl reload nginx
+  print_ok "证书续期执行完成"
 }
 
 configure_exit() {
@@ -1327,7 +1390,7 @@ while true; do
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP / 域名（仅入口）"
-  echo "11) 证书管理（仅出口）"
+  echo "11) 手动执行证书续期（仅出口）"
   echo "0) 退出"
   echo "====================================================================="
   read -rp "请选择: " choice
@@ -1343,7 +1406,7 @@ while true; do
     8) manage_entry_ports ;;
     9) manage_entry_mode ;;
     10) update_wstunnel_entry_remote_ip ;;
-    11) manage_certificates ;;
+    11) renew_cert_now ;;
     0) exit 0 ;;
     *) print_err "无效选择" ;;
   esac
