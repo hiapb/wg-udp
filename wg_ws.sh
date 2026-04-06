@@ -47,9 +47,8 @@ set_role() {
   echo "$role" > "$ROLE_FILE"
 }
 
-# 彻底修复严格模式闪退：读取内核自带的随机UUID作为字符串，绝对安全
 rand_str() {
-  cat /proc/sys/kernel/random/uuid | sed 's/-//g' | cut -c 1-24 || echo "a1b2c3d4e5f6g7h8"
+  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24 || true
 }
 
 detect_public_ip() {
@@ -74,7 +73,6 @@ ensure_dirs() {
   chmod 700 "$WG_DIR" "$WST_DIR" 2>/dev/null || true
 }
 
-# 优化获取网卡的方法，避免管道截断引发闪退
 get_wan_if() {
   local wan
   wan=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
@@ -443,7 +441,7 @@ apply_port_rules_from_file() {
     iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1
-  done < "$PORT_LIST_FILE"
+  done < "$PORT_LIST_FILE" || true
   local wst_port=""
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && wst_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   if [[ -n "$wst_port" ]]; then
@@ -562,7 +560,7 @@ enable_split_mode() {
     while read -r p; do
       [[ -z "$p" ]] && continue
       add_forward_port_mapping "$p"
-    done < "$PORT_LIST_FILE"
+    done < "$PORT_LIST_FILE" || true
   fi
   ip link set dev "${WG_IF}" mtu "${WG_SAFE_MTU}" 2>/dev/null || true
   set_mode_flag "split"
@@ -585,7 +583,6 @@ configure_exit() {
   install_wireguard
   install_wstunnel
   
-  # 提前生成并展示本机的公钥（防止两边死锁）
   cd "$WG_DIR"
   if [[ ! -f exit_private.key ]]; then
     umask 077
@@ -624,7 +621,7 @@ configure_exit() {
   read -rp "出口服务器 WG 真正监听 UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " wg_udp_port
   wg_udp_port="${wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
   backend_port=$((RANDOM % 1000 + 30000))
-  local recommended_path="static/assets/img_$(rand_str)"
+  local recommended_path="static/assets/img_$(rand_str || echo "abc1234")"
   read -rp "WebSocket 路径前缀/密钥 (默认 ${recommended_path}): " path_prefix
   path_prefix="${path_prefix:-${recommended_path}}"
   
@@ -650,7 +647,6 @@ configure_entry() {
   install_wireguard
   install_wstunnel
 
-  # 提前生成并展示本机的公钥（防止两边死锁）
   cd "$WG_DIR"
   if [[ ! -f entry_private.key ]]; then
     umask 077
@@ -666,7 +662,7 @@ configure_entry() {
   echo ""
 
   local wg_addr exit_wg_ip 
-  local ws_port path_prefix verify_tls
+  local ws_port verify_tls
   local local_udp_port remote_wg_udp_port
   local saved_host saved_port saved_path saved_verify
   
@@ -693,8 +689,19 @@ configure_entry() {
 
   read -rp "wss 端口 (默认 ${saved_port:-443}): " ws_port
   ws_port="${ws_port:-${saved_port:-443}}"
-  read -rp "路径前缀 (默认 ${saved_path:-自动生成}): " path_prefix
-  path_prefix="${path_prefix:-${saved_path:-$(rand_str)}}"
+  
+  # 🎯 彻底修复入口路径前缀逻辑，强制必填！
+  local path_prefix=""
+  while [[ -z "$path_prefix" ]]; do
+    if [[ -n "$saved_path" ]]; then
+      read -rp "请输入【路径前缀】(必须去出口服务器复制，默认 ${saved_path}): " path_prefix
+      path_prefix="${path_prefix:-$saved_path}"
+    else
+      read -rp "请输入【路径前缀】(这是连接暗号，必须去出口服务器复制，千万别瞎填): " path_prefix
+    fi
+    [[ -z "$path_prefix" ]] && echo "❌ 路径前缀是连接的暗号，绝不能留空，请重新输入！"
+  done
+
   read -rp "是否严格校验证书? (Y/n，正式域名证书建议 Y): " verify_tls
   verify_tls="${verify_tls:-Y}"
   read -rp "入口本地 wstunnel 监听 UDP 端口 (默认 ${WST_LOCAL_UDP_PORT_DEFAULT}): " local_udp_port
@@ -817,7 +824,7 @@ restart_wg() {
 update_wstunnel_entry_remote_ip() {
   [[ "$(get_role)" == "entry" ]] || return 1
   ensure_dirs
-  local new_port new_path verify_tls
+  local new_port verify_tls
   local saved_port saved_path saved_verify local_udp_port remote_wg_udp_port
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
@@ -833,8 +840,19 @@ update_wstunnel_entry_remote_ip() {
 
   read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
   new_port="${new_port:-${saved_port:-443}}"
-  read -rp "路径前缀 (默认 ${saved_path:-v1}): " new_path
-  new_path="${new_path:-${saved_path:-v1}}"
+
+  # 🎯 修改配置时同样强制必填前缀
+  local new_path=""
+  while [[ -z "$new_path" ]]; do
+    if [[ -n "$saved_path" ]]; then
+      read -rp "请输入新的【路径前缀】(必须去出口服务器复制，默认 ${saved_path}): " new_path
+      new_path="${new_path:-$saved_path}"
+    else
+      read -rp "请输入新的【路径前缀】(必须去出口服务器复制，千万别瞎填): " new_path
+    fi
+    [[ -z "$new_path" ]] && echo "❌ 路径前缀不能为空！"
+  done
+
   read -rp "是否严格校验证书? (默认 ${saved_verify:-Y}): " verify_tls
   verify_tls="${verify_tls:-${saved_verify:-Y}}"
   local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
@@ -872,7 +890,7 @@ uninstall_wg() {
       iptables -t mangle -D PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
       iptables -t mangle -D PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
       remove_forward_port_mapping "$p"
-    done < "$PORT_LIST_FILE"
+    done < "$PORT_LIST_FILE" || true
   fi
   systemctl stop wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
   systemctl disable wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
