@@ -7,6 +7,7 @@ PORT_LIST_FILE="${WG_DIR}/.wg_ports"
 MODE_FILE="${WG_DIR}/.wg_mode"
 EXIT_WG_IP_FILE="${WG_DIR}/.exit_wg_ip"
 ROLE_FILE="${WG_DIR}/.wg_role"
+INSTALLED_PKGS_FILE="${WG_DIR}/.installed_pkgs" # 新增：记录脚本安装的依赖
 WST_DIR="/etc/wstunnel"
 WSTUNNEL_BIN="/usr/local/bin/wstunnel"
 WSTUNNEL_VERSION="10.5.2"
@@ -124,6 +125,12 @@ install_base_packages() {
   export DEBIAN_FRONTEND=noninteractive
   apt update
   apt install -y "${missing[@]}"
+  
+  # 记录真正由本脚本安装的依赖
+  ensure_dirs
+  for pkg in "${missing[@]}"; do
+    echo "$pkg" >> "$INSTALLED_PKGS_FILE"
+  done
 }
 
 install_wireguard() {
@@ -138,6 +145,12 @@ install_wireguard() {
   export DEBIAN_FRONTEND=noninteractive
   apt update
   apt install -y "${missing[@]}"
+
+  # 记录真正由本脚本安装的依赖
+  ensure_dirs
+  for pkg in "${missing[@]}"; do
+    echo "$pkg" >> "$INSTALLED_PKGS_FILE"
+  done
 }
 
 install_wstunnel() {
@@ -814,20 +827,29 @@ uninstall_wg() {
   systemctl disable wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
   rm -f /etc/systemd/system/wstunnel-exit.service /etc/systemd/system/wstunnel-entry.service 2>/dev/null || true
   systemctl daemon-reload || true
+
   read -rp "是否连同Nginx伪装站点以及TLS证书一起彻底抹除？[y/N (默认N)]: " del_cert
   del_cert="${del_cert:-N}"
+
+  # 1. 先安全清理我们的特定配置文件，而不去碰系统的全局配置
   if [[ "$del_cert" =~ ^[yY]$ ]]; then
-    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx 2>/dev/null || true
-    apt autoremove -y 2>/dev/null || true
     if [[ -f "$WST_DOMAIN_FILE" ]]; then
         local d
         d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
         if [[ -n "$d" ]]; then
            rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
+           # 安全地仅删除该域名的证书，不破坏 certbot 其他域名的证书
+           certbot delete --cert-name "$d" --non-interactive 2>/dev/null || true
         fi
     fi
-    rm -rf /etc/nginx 2>/dev/null || true
-    rm -rf /etc/letsencrypt /var/lib/letsencrypt 2>/dev/null || true
+    if [[ -f "$WST_NGINX_SITE_FILE" ]]; then
+        local site_file
+        site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null || true)"
+        if [[ -n "$site_file" ]]; then
+          rm -f "$site_file" 2>/dev/null || true
+          rm -f "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")" 2>/dev/null || true
+        fi
+    fi
     sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
     sysctl -p >/dev/null 2>&1 || true
   else
@@ -841,17 +863,36 @@ uninstall_wg() {
       fi
     fi
   fi
+
+  # 2. 动态卸载我们在安装时补充安装的依赖
+  if [[ -f "$INSTALLED_PKGS_FILE" ]]; then
+    local pkgs_to_remove=()
+    while read -r pkg; do
+      [[ -z "$pkg" ]] && continue
+      # 如果用户选择不删证书，那么我们要从待卸载列表中剔除 nginx 和 certbot 相关的包
+      if [[ ! "$del_cert" =~ ^[yY]$ ]] && [[ "$pkg" =~ nginx|certbot ]]; then
+        continue
+      fi
+      pkgs_to_remove+=("$pkg")
+    done < "$INSTALLED_PKGS_FILE"
+
+    if [[ ${#pkgs_to_remove[@]} -gt 0 ]]; then
+      echo "⏳ 正在卸载由脚本安装的依赖: ${pkgs_to_remove[*]}"
+      apt purge -y "${pkgs_to_remove[@]}" 2>/dev/null || true
+      apt autoremove -y 2>/dev/null || true
+    fi
+  fi
+
   rm -rf "$WST_DIR" "$WG_DIR" 2>/dev/null || true
   rm -f "$WSTUNNEL_BIN" 2>/dev/null || true
-  apt remove -y wireguard wireguard-tools 2>/dev/null || true
-  apt autoremove -y 2>/dev/null || true
   rm -f "$0" 2>/dev/null || true
+  echo "✅ 卸载并清理完成。"
   exit 0
 }
 
 while true; do
   echo
-  echo "================ 📡 WG + wstunnel v10 + Nginx 高级链路 ================"
+  echo "================ 📡 WG + wstunnel + Nginx 高级链路 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看链路状态"
