@@ -175,7 +175,7 @@ install_singbox() {
     return 0
   fi
 
-  local arch file tmpdir release_json release_url bin_url sum_url extracted_bin expected actual
+  local arch file tmpdir release_json bin_url digest extracted_bin actual expected
   arch="$(uname -m)"
 
   case "$arch" in
@@ -211,15 +211,9 @@ install_singbox() {
     ' "$release_json" | head -n1
   )
 
-  sum_url=$(
-    jq -r '
-      .assets[]
-      | select(
-          (.name | test("sha256|sha256sum|checksums"; "i"))
-          and
-          (.name | test("\\.(txt|sum|sha256sum)$"; "i"))
-        )
-      | .browser_download_url
+  digest=$(
+    jq -r --arg name "$file" '
+      .assets[] | select(.name == $name) | .digest // empty
     ' "$release_json" | head -n1
   )
 
@@ -228,37 +222,23 @@ install_singbox() {
     exit 1
   fi
 
-  if [[ -z "${sum_url:-}" || "$sum_url" == "null" ]]; then
-    echo "❌ 未在官方 release 中找到 SHA256 校验文件"
+  if [[ -z "${digest:-}" || "$digest" == "null" ]]; then
+    echo "❌ 未在官方 release API 中找到该资产的 digest"
+    echo "❌ 当前脚本要求必须进行 SHA256 校验，故终止"
+    exit 1
+  fi
+
+  if [[ "$digest" =~ ^sha256:([A-Fa-f0-9]{64})$ ]]; then
+    expected="${BASH_REMATCH[1],,}"
+  elif [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]]; then
+    expected="${digest,,}"
+  else
+    echo "❌ digest 格式无法识别: $digest"
     exit 1
   fi
 
   echo "[*] 下载 sing-box ${SING_VERSION}..."
   curl -fL --retry 3 --connect-timeout 15 "$bin_url" -o "${tmpdir}/${file}"
-
-  echo "[*] 下载 SHA256 校验文件..."
-  curl -fL --retry 3 --connect-timeout 15 "$sum_url" -o "${tmpdir}/checksums.txt"
-
-  expected=$(
-    awk -v f="$file" '
-      $0 ~ f {
-        for (i=1; i<=NF; i++) {
-          if ($i ~ /^[A-Fa-f0-9]{64}$/) {
-            print tolower($i)
-            exit
-          }
-        }
-      }
-    ' "${tmpdir}/checksums.txt"
-  )
-
-  if [[ -z "${expected:-}" ]]; then
-    echo "❌ 在校验文件中未找到目标文件的 SHA256: $file"
-    echo "---- checksums.txt 内容预览 ----"
-    sed -n '1,30p' "${tmpdir}/checksums.txt" || true
-    echo "--------------------------------"
-    exit 1
-  fi
 
   actual="$(sha256sum "${tmpdir}/${file}" | awk '{print tolower($1)}')"
 
