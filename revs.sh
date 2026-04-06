@@ -25,6 +25,24 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
+trim() {
+  local s="${1:-}"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s' "$s"
+}
+
+cmd_exists() {
+  command -v "$1" >/dev/null 2>&1
+}
+
+require_apt() {
+  if ! cmd_exists apt-get; then
+    echo "❌ 当前系统未检测到 apt-get，本脚本仅支持 Debian / Ubuntu 系。"
+    exit 1
+  fi
+}
+
 get_role() {
   [[ -f "$ROLE_FILE" ]] && cat "$ROLE_FILE" 2>/dev/null || echo "unknown"
 }
@@ -64,10 +82,37 @@ enable_ip_forward_global() {
 }
 
 install_base_packages() {
-  echo "[*] 安装基础依赖..."
+  echo "[*] 检查并安装基础依赖..."
+  require_apt
   export DEBIAN_FRONTEND=noninteractive
-  apt-get update -yq
-  apt-get install -yq curl wget tar jq nginx certbot python3-certbot-nginx ca-certificates openssl
+
+  local pkgs=()
+
+  cmd_exists curl || pkgs+=("curl")
+  cmd_exists wget || pkgs+=("wget")
+  cmd_exists tar || pkgs+=("tar")
+  cmd_exists jq || pkgs+=("jq")
+  cmd_exists nginx || pkgs+=("nginx")
+  cmd_exists certbot || pkgs+=("certbot")
+
+  if ! dpkg -s python3-certbot-nginx >/dev/null 2>&1; then
+    pkgs+=("python3-certbot-nginx")
+  fi
+
+  if ! dpkg -s ca-certificates >/dev/null 2>&1; then
+    pkgs+=("ca-certificates")
+  fi
+
+  if ! dpkg -s openssl >/dev/null 2>&1; then
+    pkgs+=("openssl")
+  fi
+
+  if [[ "${#pkgs[@]}" -gt 0 ]]; then
+    apt-get update -yq
+    apt-get install -yq "${pkgs[@]}"
+  else
+    echo "[*] 基础依赖已齐全"
+  fi
 }
 
 ensure_server_bypass_route() {
@@ -175,7 +220,8 @@ install_singbox() {
     return 0
   fi
 
-  local arch file tmpdir release_json bin_url digest extracted_bin actual expected
+  local arch file release_json bin_url digest extracted_bin actual expected
+  local tmpdir=""
   arch="$(uname -m)"
 
   case "$arch" in
@@ -194,8 +240,6 @@ install_singbox() {
   esac
 
   tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' RETURN
-
   release_json="${tmpdir}/release.json"
 
   echo "[*] 获取官方 release 资产列表..."
@@ -218,11 +262,13 @@ install_singbox() {
   )
 
   if [[ -z "${bin_url:-}" || "$bin_url" == "null" ]]; then
+    rm -rf "$tmpdir"
     echo "❌ 未在官方 release 中找到二进制文件: $file"
     exit 1
   fi
 
   if [[ -z "${digest:-}" || "$digest" == "null" ]]; then
+    rm -rf "$tmpdir"
     echo "❌ 未在官方 release API 中找到该资产的 digest"
     echo "❌ 当前脚本要求必须进行 SHA256 校验，故终止"
     exit 1
@@ -233,6 +279,7 @@ install_singbox() {
   elif [[ "$digest" =~ ^[A-Fa-f0-9]{64}$ ]]; then
     expected="${digest,,}"
   else
+    rm -rf "$tmpdir"
     echo "❌ digest 格式无法识别: $digest"
     exit 1
   fi
@@ -244,6 +291,7 @@ install_singbox() {
 
   echo "[*] 执行 SHA256 校验..."
   if [[ "$actual" != "$expected" ]]; then
+    rm -rf "$tmpdir"
     echo "❌ 致命错误：SHA256 校验失败"
     echo "期望: $expected"
     echo "实际: $actual"
@@ -257,11 +305,13 @@ install_singbox() {
 
   extracted_bin="$(find "$tmpdir" -type f -name sing-box | head -n1)"
   if [[ -z "${extracted_bin:-}" ]]; then
+    rm -rf "$tmpdir"
     echo "❌ 解压后未找到 sing-box 可执行文件"
     exit 1
   fi
 
   install -m 0755 "$extracted_bin" "$SING_BIN"
+  rm -rf "$tmpdir"
 
   if [[ ! -x "$SING_BIN" ]]; then
     echo "❌ sing-box 安装失败"
@@ -277,6 +327,7 @@ write_nginx_http_site_for_acme() {
   local web_root="${WEB_ROOT_BASE}/${domain}"
 
   mkdir -p "$web_root"
+  mkdir -p "$NGINX_SITE_DIR" "$NGINX_SITE_ENABLED_DIR"
 
   cat > "$site_file" <<EOF
 server {
@@ -310,6 +361,7 @@ write_nginx_https_reality_site() {
   local web_root="${WEB_ROOT_BASE}/${domain}"
 
   mkdir -p "$web_root"
+  mkdir -p "$NGINX_SITE_DIR" "$NGINX_SITE_ENABLED_DIR"
 
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
@@ -651,22 +703,26 @@ apply_current_mode() {
 
 choose_sni() {
   init_sni_list
-  echo "==== 请选择初始 SNI ====" >&2
-  echo "1) itunes.apple.com (默认)" >&2
-  echo "2) www.apple.com" >&2
-  echo "3) update.apple.com" >&2
-  echo "4) gateway.icloud.com" >&2
-  echo "5) www.samsung.com" >&2
-  echo "6) www.google.com" >&2
-  read -rp "输入序号 [1-6]: " sni_idx >&2
-  case "$sni_idx" in
-    2) echo "www.apple.com" ;;
-    3) echo "update.apple.com" ;;
-    4) echo "gateway.icloud.com" ;;
-    5) echo "www.samsung.com" ;;
-    6) echo "www.google.com" ;;
-    *) echo "itunes.apple.com" ;;
-  esac
+  while true; do
+    echo "==== 请选择初始 SNI ====" >&2
+    echo "1) itunes.apple.com (默认)" >&2
+    echo "2) www.apple.com" >&2
+    echo "3) update.apple.com" >&2
+    echo "4) gateway.icloud.com" >&2
+    echo "5) www.samsung.com" >&2
+    echo "6) www.google.com" >&2
+    read -rp "输入序号 [1-6，直接回车默认1]: " sni_idx >&2
+    sni_idx="$(trim "${sni_idx:-}")"
+    case "$sni_idx" in
+      ""|1) echo "itunes.apple.com"; return ;;
+      2) echo "www.apple.com"; return ;;
+      3) echo "update.apple.com"; return ;;
+      4) echo "gateway.icloud.com"; return ;;
+      5) echo "www.samsung.com"; return ;;
+      6) echo "www.google.com"; return ;;
+      *) echo "❌ 请输入 1-6 之间的序号" >&2 ;;
+    esac
+  done
 }
 
 configure_exit() {
@@ -682,8 +738,14 @@ configure_exit() {
   pub_ip="$(detect_public_ip || true)"
   [[ -n "$pub_ip" ]] && echo "[*] 检测到公网 IP：$pub_ip"
 
-  read -rp "出口服务器绑定域名（必须解析到本机）: " domain
-  [[ -z "$domain" ]] && { echo "❌ 域名不能为空"; return; }
+  while true; do
+    read -rp "出口服务器绑定域名（必须解析到本机）: " domain
+    domain="$(trim "$domain")"
+    if [[ -n "$domain" ]]; then
+      break
+    fi
+    echo "❌ 域名不能为空，请重新输入。"
+  done
 
   short_id="$(rand_str)"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
@@ -721,10 +783,33 @@ configure_entry() {
 
   local remote_host short_id public_key uuid chosen_sni enable_rotate
 
-  read -rp "出口服务器域名/IP: " remote_host
-  read -rp "short_id: " short_id
-  read -rp "public_key: " public_key
-  read -rp "UUID: " uuid
+  while true; do
+    read -rp "出口服务器域名/IP: " remote_host
+    remote_host="$(trim "$remote_host")"
+    [[ -n "$remote_host" ]] && break
+    echo "❌ 出口服务器域名/IP 不能为空，请重新输入。"
+  done
+
+  while true; do
+    read -rp "short_id: " short_id
+    short_id="$(trim "$short_id")"
+    [[ -n "$short_id" ]] && break
+    echo "❌ short_id 不能为空，请重新输入。"
+  done
+
+  while true; do
+    read -rp "public_key: " public_key
+    public_key="$(trim "$public_key")"
+    [[ -n "$public_key" ]] && break
+    echo "❌ public_key 不能为空，请重新输入。"
+  done
+
+  while true; do
+    read -rp "UUID: " uuid
+    uuid="$(trim "$uuid")"
+    [[ -n "$uuid" ]] && break
+    echo "❌ UUID 不能为空，请重新输入。"
+  done
 
   chosen_sni="$(choose_sni)"
 
@@ -737,6 +822,7 @@ configure_entry() {
   setup_entry_reality "$remote_host" "$short_id" "$public_key" "$uuid" "$chosen_sni"
 
   read -rp "是否开启 SNI 自动定时轮换？(Y/n): " enable_rotate
+  enable_rotate="$(trim "${enable_rotate:-}")"
   if [[ "${enable_rotate,,}" == "y" || -z "$enable_rotate" ]]; then
     setup_sni_rotation
   fi
@@ -766,6 +852,7 @@ manage_entry_ports() {
         ;;
       2)
         read -rp "端口: " new_port
+        new_port="$(trim "${new_port:-}")"
         if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] && [ "$new_port" -ne 22 ]; then
           mkdir -p "$(dirname "$PORT_LIST_FILE")"
           touch "$PORT_LIST_FILE"
@@ -783,6 +870,7 @@ manage_entry_ports() {
         ;;
       3)
         read -rp "要删除的端口: " del_port
+        del_port="$(trim "${del_port:-}")"
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           if [[ -f "$PORT_LIST_FILE" ]] && grep -qx "$del_port" "$PORT_LIST_FILE"; then
             sed -i "\|^$del_port$|d" "$PORT_LIST_FILE"
@@ -792,6 +880,8 @@ manage_entry_ports() {
           else
             echo "端口 $del_port 不在列表中。"
           fi
+        else
+          echo "❌ 端口无效"
         fi
         ;;
       0) break ;;
@@ -866,8 +956,13 @@ update_remote() {
   [[ "$(get_role)" != "entry" ]] && { echo "❌ 仅入口可用"; return; }
 
   echo "更新出口地址..."
-  read -rp "新出口域名/IP: " new_host
-  [[ -z "$new_host" ]] && { echo "❌ 不能为空"; return; }
+  local new_host
+  while true; do
+    read -rp "新出口域名/IP: " new_host
+    new_host="$(trim "$new_host")"
+    [[ -n "$new_host" ]] && break
+    echo "❌ 不能为空，请重新输入。"
+  done
 
   echo "$new_host" > "${SING_DIR}/remote_host"
 
@@ -889,21 +984,66 @@ renew_cert_now() {
 }
 
 uninstall() {
-  read -rp "确认彻底卸载 Reality？(y/N): " confirm
+  read -rp "确认彻底卸载 Reality，并删除 nginx/certbot？(y/N): " confirm
+  confirm="$(trim "${confirm:-}")"
   [[ ! "$confirm" =~ ^[yY]$ ]] && return
 
-  systemctl stop singbox-exit.service singbox-entry.service nginx 2>/dev/null || true
-  systemctl disable singbox-exit.service singbox-entry.service sni-rotate.timer 2>/dev/null || true
+  local domain=""
+  [[ -f "${SING_DIR}/domain" ]] && domain="$(cat "${SING_DIR}/domain" 2>/dev/null || true)"
+  domain="$(trim "${domain:-}")"
 
-  rm -f /etc/systemd/system/singbox-*.service
-  rm -f /etc/systemd/system/sni-rotate.service /etc/systemd/system/sni-rotate.timer
+  echo "[*] 停止服务..."
+  systemctl stop singbox-exit.service singbox-entry.service sni-rotate.timer sni-rotate.service nginx 2>/dev/null || true
+  systemctl disable singbox-exit.service singbox-entry.service sni-rotate.timer nginx 2>/dev/null || true
 
+  echo "[*] 删除 systemd 单元..."
+  rm -f /etc/systemd/system/singbox-exit.service
+  rm -f /etc/systemd/system/singbox-entry.service
+  rm -f /etc/systemd/system/sni-rotate.service
+  rm -f /etc/systemd/system/sni-rotate.timer
   systemctl daemon-reload
+  systemctl reset-failed 2>/dev/null || true
 
+  echo "[*] 清理 sing-box 文件..."
   rm -rf "$SING_DIR"
   rm -f "$SING_BIN"
 
-  echo "✅ Reality 已彻底清理"
+  echo "[*] 清理 tun 设备..."
+  ip link del "$SING_IF" 2>/dev/null || true
+
+  if [[ -n "$domain" ]]; then
+    echo "[*] 清理 nginx 站点: $domain"
+    rm -f "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
+    rm -f "${NGINX_SITE_DIR}/${domain}.conf"
+    rm -rf "${WEB_ROOT_BASE}/${domain}"
+
+    echo "[*] 清理 Let's Encrypt 证书: $domain"
+    certbot delete --cert-name "$domain" --non-interactive 2>/dev/null || true
+    rm -rf "/etc/letsencrypt/live/${domain}"
+    rm -rf "/etc/letsencrypt/archive/${domain}"
+    rm -f "/etc/letsencrypt/renewal/${domain}.conf"
+  fi
+
+  echo "[*] 删除全部 nginx 配置与数据..."
+  rm -rf /etc/nginx
+  rm -rf /var/log/nginx
+  rm -rf /var/lib/nginx
+
+  echo "[*] 删除全部 certbot / letsencrypt 数据..."
+  rm -rf /etc/letsencrypt
+  rm -rf /var/lib/letsencrypt
+  rm -rf /var/log/letsencrypt
+
+  echo "[*] 卸载 nginx / certbot / python3-certbot-nginx ..."
+  require_apt
+  export DEBIAN_FRONTEND=noninteractive
+  apt-get remove --purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx 2>/dev/null || true
+  apt-get autoremove --purge -y 2>/dev/null || true
+
+  echo "[*] 清理残留临时文件..."
+  rm -f /tmp/sing-box*.tar.gz /tmp/sing-box*.tmp 2>/dev/null || true
+
+  echo "✅ 已彻底卸载：sing-box / nginx / certbot 已删除，curl 与 jq 保留"
   exit 0
 }
 
