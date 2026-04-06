@@ -124,7 +124,6 @@ install_base_packages() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt update </dev/null || true
-  # 关键修复：加入 </dev/null 防止 apt 吞噬终端复制粘贴的剩余脚本
   apt install -y "${missing[@]}" </dev/null
   
   ensure_dirs
@@ -144,7 +143,6 @@ install_wireguard() {
   fi
   export DEBIAN_FRONTEND=noninteractive
   apt update </dev/null || true
-  # 关键修复：加入 </dev/null 防止 apt 吞噬终端复制粘贴的剩余脚本
   apt install -y "${missing[@]}" </dev/null
 
   ensure_dirs
@@ -172,7 +170,8 @@ install_wstunnel() {
   esac
   url_base="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}"
   url_bin="${url_base}/${file}"
-  url_sum="${url_base}/wstunnel_${WSTUNNEL_VERSION}_checksums.txt"
+  # ❗ 修复了这里：GitHub上实际的校验文件名就是 checksums.txt
+  url_sum="${url_base}/checksums.txt"
   tmpdir="$(mktemp -d)"
   
   echo "⏳ 正在从 GitHub 下载 wstunnel，请稍候..."
