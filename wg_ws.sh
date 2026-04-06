@@ -7,7 +7,6 @@ PORT_LIST_FILE="${WG_DIR}/.wg_ports"
 MODE_FILE="${WG_DIR}/.wg_mode"
 EXIT_WG_IP_FILE="${WG_DIR}/.exit_wg_ip"
 ROLE_FILE="${WG_DIR}/.wg_role"
-INSTALLED_PKGS_FILE="${WG_DIR}/.installed_pkgs"
 
 WST_DIR="/etc/wstunnel"
 WSTUNNEL_BIN="/usr/local/bin/wstunnel"
@@ -57,18 +56,6 @@ normalize_path_prefix() {
   p="${p#/}"
   p="${p%/}"
   echo "$p"
-}
-
-detect_public_ip() {
-  local ip=""
-  for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
-    ip=$(curl -4 -fsS --max-time 3 "$svc" </dev/null 2>/dev/null || true)
-    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "$ip"
-      return 0
-    fi
-  done
-  return 1
 }
 
 resolve_ipv4() {
@@ -121,45 +108,15 @@ ensure_server_bypass_route() {
 }
 
 install_base_packages() {
-  local need_pkgs=(curl tar ca-certificates iproute2 iptables nginx openssl lsb-release certbot python3-certbot-nginx)
-  local missing=()
-  for pkg in "${need_pkgs[@]}"; do
-    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
-  done
-  [[ ${#missing[@]} -eq 0 ]] && return 0
-
   export DEBIAN_FRONTEND=noninteractive
-  apt update </dev/null || true
-  apt install -y "${missing[@]}" </dev/null
-
-  ensure_dirs
-  : > "$INSTALLED_PKGS_FILE.tmp"
-  for pkg in "${missing[@]}"; do
-    echo "$pkg" >> "$INSTALLED_PKGS_FILE.tmp"
-  done
-  cat "$INSTALLED_PKGS_FILE.tmp" >> "$INSTALLED_PKGS_FILE" 2>/dev/null || cat "$INSTALLED_PKGS_FILE.tmp" > "$INSTALLED_PKGS_FILE"
-  rm -f "$INSTALLED_PKGS_FILE.tmp"
+  apt update -y >/dev/null 2>&1 || true
+  apt install -y curl tar ca-certificates iproute2 iptables openssl lsb-release nginx certbot python3-certbot-nginx >/dev/null 2>&1
 }
 
 install_wireguard() {
-  local need_pkgs=(wireguard wireguard-tools)
-  local missing=()
-  for pkg in "${need_pkgs[@]}"; do
-    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
-  done
-  [[ ${#missing[@]} -eq 0 ]] && return 0
-
   export DEBIAN_FRONTEND=noninteractive
-  apt update </dev/null || true
-  apt install -y "${missing[@]}" </dev/null
-
-  ensure_dirs
-  : > "$INSTALLED_PKGS_FILE.tmp"
-  for pkg in "${missing[@]}"; do
-    echo "$pkg" >> "$INSTALLED_PKGS_FILE.tmp"
-  done
-  cat "$INSTALLED_PKGS_FILE.tmp" >> "$INSTALLED_PKGS_FILE" 2>/dev/null || cat "$INSTALLED_PKGS_FILE.tmp" > "$INSTALLED_PKGS_FILE"
-  rm -f "$INSTALLED_PKGS_FILE.tmp"
+  apt update -y >/dev/null 2>&1 || true
+  apt install -y wireguard wireguard-tools >/dev/null 2>&1
 }
 
 install_wstunnel() {
@@ -184,18 +141,16 @@ install_wstunnel() {
   url_sum="${url_base}/checksums.txt"
   tmpdir="$(mktemp -d)"
 
-  echo "⏳ 正在下载 wstunnel..."
+  echo "⏳ 正在下载并安装 wstunnel ..."
   (
     cd "$tmpdir"
-    curl -sL --fail "$url_sum" -o checksums.txt </dev/null
-    curl -L --fail "$url_bin" -o "$file" </dev/null
-    grep "$file" checksums.txt | sha256sum -c -
+    curl -fsSL "$url_sum" -o checksums.txt
+    curl -fL "$url_bin" -o "$file"
+    grep "$file" checksums.txt | sha256sum -c - >/dev/null
     tar -xzf "$file"
-    bin_name="$(find . -maxdepth 1 -type f \( -name "wstunnel" -o -name "wstunnel-cli" \) 2>/dev/null | head -n1 || true)"
-    [[ -n "$bin_name" ]] || { echo "❌ 未找到 wstunnel 可执行文件"; exit 1; }
+    bin_name="$(find . -maxdepth 1 -type f \( -name 'wstunnel' -o -name 'wstunnel-cli' \) | head -n1)"
     install -m 0755 "$bin_name" "$WSTUNNEL_BIN"
-  ) || { rm -rf "$tmpdir"; echo "❌ 安装 wstunnel 失败"; exit 1; }
-
+  )
   rm -rf "$tmpdir"
   echo "✅ wstunnel 安装完成"
 }
@@ -232,7 +187,9 @@ EOF
 
 issue_letsencrypt_cert() {
   local domain="$1"
-  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect </dev/null
+  echo "⏳ 正在申请 HTTPS 证书: ${domain}"
+  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect >/dev/null 2>&1
+  echo "✅ HTTPS 证书申请完成: ${domain}"
 }
 
 write_nginx_https_wstunnel_site() {
@@ -267,7 +224,7 @@ write_nginx_https_wstunnel_site() {
 <h1>春日漫无目的散步</h1>
 <p class="date">2026年4月</p>
 <p>周末难得是个大晴天，没有定闹钟，睡到自然醒。下楼顺着街边一直往前走，没开导航，就是想随便看看平时匆匆路过的风景。</p>
-<p>在转角的一家老旧咖啡馆坐了一个下午，看书，发呆，听隔壁桌聊着琐碎的生活日常。阳光打在木桌上，光影拉得很长。生活其实不需要那么多宏大的叙事，这种可以自由支配时间的缝隙，本身就是一种治愈。</p>
+<p>在转角的一家老旧咖啡馆坐了一个下午，看书，发呆，听隔壁桌聊着琐碎的生活日常。阳光打在木桌上，光影拉得很长。</p>
 <hr>
 <footer>© 2026 个人碎碎念</footer>
 </body>
@@ -345,7 +302,7 @@ server {
 EOF
 
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
-  nginx -t && systemctl restart nginx
+  nginx -t >/dev/null && systemctl restart nginx
   echo "$site_file" > "$WST_NGINX_SITE_FILE"
 }
 
@@ -365,7 +322,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=${WSTUNNEL_BIN} server --restrict-to udp://127.0.0.1:${wg_udp_port} --restrict-http-upgrade-path-prefix ${path_prefix} ws://127.0.0.1:${backend_port}
+ExecStart=${WSTUNNEL_BIN} server --restrict-to 127.0.0.1:${wg_udp_port} --restrict-http-upgrade-path-prefix ${path_prefix} ws://127.0.0.1:${backend_port}
 Restart=on-failure
 RestartSec=2
 User=root
@@ -377,7 +334,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable wstunnel-exit.service >/dev/null 2>&1 || true
-  systemctl restart wstunnel-exit.service || true
+  systemctl restart wstunnel-exit.service
 }
 
 setup_entry_wstunnel_service() {
@@ -418,7 +375,7 @@ EOF
 
   systemctl daemon-reload
   systemctl enable wstunnel-entry.service >/dev/null 2>&1 || true
-  systemctl restart wstunnel-entry.service || true
+  systemctl restart wstunnel-entry.service
 }
 
 configure_exit_wg() {
@@ -654,24 +611,197 @@ enable_split_mode() {
   set_mode_flag "split"
 }
 
-apply_current_mode() {
-  local mode
-  mode="$(get_current_mode)"
-  if [[ "$mode" == "global" ]]; then
-    enable_global_mode
+show_status() {
+  echo "角色: $(get_role)"
+  echo "模式: $(get_current_mode)"
+  [[ -f "$WST_REMOTE_HOST_FILE" ]] && echo "远端主机: $(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && echo "远端端口: $(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_PATH_FILE" ]] && echo "路径前缀: $(cat "$WST_PATH_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_DOMAIN_FILE" ]] && echo "出口域名: $(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_WG_UDP_PORT_FILE" ]] && echo "WG UDP端口: $(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && echo "本地wstunnel UDP端口: $(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
+  echo
+  wg show || true
+  echo
+  systemctl --no-pager --full status wstunnel-exit.service 2>/dev/null | sed -n '1,10p' || true
+  echo
+  systemctl --no-pager --full status wstunnel-entry.service 2>/dev/null | sed -n '1,10p' || true
+  echo
+  systemctl --no-pager --full status nginx 2>/dev/null | sed -n '1,10p' || true
+}
+
+manage_entry_ports() {
+  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器"; return 1; }
+  ensure_policy_routing_for_ports
+
+  while true; do
+    echo
+    echo "============== 入口端口分流管理 =============="
+    echo "1) 查看当前分流端口"
+    echo "2) 添加分流端口"
+    echo "3) 删除分流端口"
+    echo "0) 返回上一级"
+    echo "============================================="
+    read -rp "请选择: " sub
+
+    case "$sub" in
+      1)
+        if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
+          cat "$PORT_LIST_FILE"
+        else
+          echo "当前没有分流端口"
+        fi
+        ;;
+      2)
+        read -rp "端口: " new_port
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]] && [[ "$new_port" -ne 22 ]]; then
+          add_port_to_list "$new_port"
+          apply_port_rules_from_file
+          add_forward_port_mapping "$new_port"
+          echo "✅ 已添加端口: $new_port"
+        else
+          echo "❌ 端口不合法"
+        fi
+        ;;
+      3)
+        read -rp "要删除的端口: " del_port
+        if [[ "$del_port" =~ ^[0-9]+$ ]]; then
+          remove_port_from_list "$del_port"
+          remove_port_iptables_rules "$del_port"
+          remove_forward_port_mapping "$del_port"
+          echo "✅ 已删除端口: $del_port"
+        else
+          echo "❌ 端口不合法"
+        fi
+        ;;
+      0) break ;;
+      *) echo "❌ 无效选择" ;;
+    esac
+  done
+}
+
+manage_entry_mode() {
+  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器"; return 1; }
+
+  while true; do
+    local mode
+    mode="$(get_current_mode)"
+    echo
+    echo "============== 入口模式管理 =============="
+    echo "当前模式: ${mode}"
+    echo "1) 切换为 全局模式"
+    echo "2) 切换为 分流模式"
+    echo "0) 返回上一级"
+    echo "========================================="
+    read -rp "请选择: " sub
+
+    case "$sub" in
+      1) enable_global_mode; echo "✅ 已切换为全局模式" ;;
+      2) enable_split_mode; echo "✅ 已切换为分流模式" ;;
+      0) break ;;
+      *) echo "❌ 无效选择" ;;
+    esac
+  done
+}
+
+start_wg() {
+  local role
+  role="$(get_role)"
+
+  if [[ "$role" == "exit" ]]; then
+    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+    wg-quick up "${WG_IF}" 2>/dev/null || true
+    systemctl restart nginx 2>/dev/null || true
+    systemctl restart wstunnel-exit.service 2>/dev/null || true
+    echo "✅ 出口已启动"
+  elif [[ "$role" == "entry" ]]; then
+    systemctl restart wstunnel-entry.service 2>/dev/null || true
+    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+    wg-quick up "${WG_IF}" 2>/dev/null || true
+    ensure_server_bypass_route
+    local mode
+    mode="$(get_current_mode)"
+    if [[ "$mode" == "global" ]]; then
+      enable_global_mode
+    else
+      enable_split_mode
+    fi
+    echo "✅ 入口已启动"
   else
-    enable_split_mode
+    echo "❌ 还未配置角色"
   fi
 }
 
-check_wstunnel_entry_health() {
-  systemctl is-active --quiet wstunnel-entry.service || return 1
-  journalctl -u wstunnel-entry.service -n 20 --no-pager 2>/dev/null | grep -Eq 'connected|websocket handshake|UDP connection' || true
+stop_wg() {
+  local role
+  role="$(get_role)"
+
+  if [[ "$role" == "exit" ]]; then
+    systemctl stop wstunnel-exit.service 2>/dev/null || true
+  elif [[ "$role" == "entry" ]]; then
+    systemctl stop wstunnel-entry.service 2>/dev/null || true
+  fi
+
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
+  clear_mark_rules
+  echo "✅ 已停止"
 }
 
-check_wstunnel_exit_health() {
-  systemctl is-active --quiet wstunnel-exit.service || return 1
-  return 0
+restart_wg() {
+  stop_wg
+  start_wg
+}
+
+update_wstunnel_entry_remote_ip() {
+  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器"; return 1; }
+
+  local saved_port="" saved_path="" saved_verify="" local_udp_port="" remote_wg_udp_port=""
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && local_udp_port="$(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_WG_UDP_PORT_FILE" ]] && remote_wg_udp_port="$(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
+
+  local new_host=""
+  while [[ -z "$new_host" ]]; do
+    read -rp "新出口域名 / IP: " new_host
+    [[ -z "$new_host" ]] && echo "❌ 出口地址不能为空"
+  done
+
+  read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
+  new_port="${new_port:-${saved_port:-443}}"
+
+  local new_path=""
+  while [[ -z "$new_path" ]]; do
+    read -rp "请输入新的【路径前缀】(默认 ${saved_path}): " new_path
+    new_path="${new_path:-$saved_path}"
+    new_path="$(normalize_path_prefix "$new_path")"
+    [[ -z "$new_path" ]] && echo "❌ 路径前缀不能为空"
+  done
+
+  read -rp "是否严格校验证书? (默认 ${saved_verify:-Y}): " verify_tls
+  verify_tls="${verify_tls:-${saved_verify:-Y}}"
+  local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
+  remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+
+  save_wst_params "$new_host" "$new_port" "$new_path" "$verify_tls"
+  setup_entry_wstunnel_service "$new_host" "$new_port" "$new_path" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
+
+  echo "✅ 已更新出口地址"
+  echo "新地址: $new_host:$new_port"
+  echo "新路径: $new_path"
+}
+
+renew_cert_now() {
+  if [[ "$(get_role)" != "exit" ]]; then
+    echo "❌ 仅出口服务器可用"
+    return
+  fi
+  install_base_packages
+  certbot renew --nginx >/dev/null 2>&1 || true
+  nginx -t >/dev/null && systemctl reload nginx
+  echo "✅ 证书续期执行完成"
 }
 
 configure_exit() {
@@ -690,10 +820,10 @@ configure_exit() {
   exit_public_key="$(cat exit_public.key)"
 
   echo
-  echo -e "\033[42;37m =============================================== \033[0m"
-  echo -e "\033[42;37m 🔑 【本机（出口服务器）公钥】请复制并保存好：   \033[0m"
-  echo -e "\033[32m${exit_public_key}\033[0m"
-  echo -e "\033[42;37m =============================================== \033[0m"
+  echo "=================================================="
+  echo "【本机（出口服务器）公钥】"
+  echo "$exit_public_key"
+  echo "=================================================="
   echo
 
   local domain=""
@@ -739,12 +869,17 @@ configure_exit() {
   setup_exit_wstunnel_service "$backend_port" "$path_prefix" "$wg_udp_port"
   save_wst_params "$domain" "$ws_port" "$path_prefix" "y"
 
+  echo
+  echo "=================================================="
   echo "✅ 出口配置完成"
-  echo "域名: $domain"
-  echo "路径前缀: $path_prefix"
-  echo "WSS端口: $ws_port"
-  echo "WG UDP端口: $wg_udp_port"
-  systemctl status wstunnel-exit.service --no-pager -l | sed -n '1,12p' || true
+  echo "域名: ${domain}"
+  echo "WSS端口: ${ws_port}"
+  echo "WG UDP端口: ${wg_udp_port}"
+  echo
+  echo "【请复制给入口机的路径前缀】"
+  echo "${path_prefix}"
+  echo "=================================================="
+  echo
 }
 
 configure_entry() {
@@ -763,10 +898,10 @@ configure_entry() {
   entry_public_key="$(cat entry_public.key)"
 
   echo
-  echo -e "\033[44;37m =============================================== \033[0m"
-  echo -e "\033[44;37m 🔑 【本机（入口服务器）公钥】请复制并保存好：   \033[0m"
-  echo -e "\033[34m${entry_public_key}\033[0m"
-  echo -e "\033[44;37m =============================================== \033[0m"
+  echo "=================================================="
+  echo "【本机（入口服务器）公钥】"
+  echo "$entry_public_key"
+  echo "=================================================="
   echo
 
   local wg_addr exit_wg_ip ws_port verify_tls local_udp_port remote_wg_udp_port
@@ -825,230 +960,35 @@ configure_entry() {
 
   configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
   ensure_server_bypass_route
-  ensure_policy_routing_for_ports
   set_mode_flag "split"
-  apply_current_mode
+  enable_split_mode
 
+  echo
+  echo "=================================================="
   echo "✅ 入口配置完成"
-  systemctl status wstunnel-entry.service --no-pager -l | sed -n '1,12p' || true
-  journalctl -u wstunnel-entry.service -n 20 --no-pager || true
-}
-
-manage_entry_ports() {
-  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器，不能管理入口端口"; return 1; }
-  ensure_policy_routing_for_ports
-
-  while true; do
-    echo
-    echo "============== 入口端口分流管理 =============="
-    echo "1) 查看当前分流端口"
-    echo "2) 添加分流端口"
-    echo "3) 删除分流端口"
-    echo "0) 返回上一级"
-    echo "============================================="
-    read -rp "请选择: " sub
-
-    case "$sub" in
-      1)
-        if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
-          echo "当前端口列表:"
-          cat "$PORT_LIST_FILE"
-        else
-          echo "当前没有分流端口"
-        fi
-        ;;
-      2)
-        read -rp "端口: " new_port
-        if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]] && [[ "$new_port" -ne 22 ]]; then
-          add_port_to_list "$new_port"
-          ensure_policy_routing_for_ports
-          apply_port_rules_from_file
-          add_forward_port_mapping "$new_port"
-          echo "✅ 已添加端口: $new_port"
-        else
-          echo "❌ 端口不合法"
-        fi
-        ;;
-      3)
-        read -rp "要删除的端口: " del_port
-        if [[ "$del_port" =~ ^[0-9]+$ ]]; then
-          remove_port_from_list "$del_port"
-          remove_port_iptables_rules "$del_port"
-          remove_forward_port_mapping "$del_port"
-          echo "✅ 已删除端口: $del_port"
-        else
-          echo "❌ 端口不合法"
-        fi
-        ;;
-      0) break ;;
-      *) echo "❌ 无效选择" ;;
-    esac
-  done
-}
-
-manage_entry_mode() {
-  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器，不能切换入口模式"; return 1; }
-
-  while true; do
-    local mode
-    mode="$(get_current_mode)"
-    echo
-    echo "============== 入口模式管理 =============="
-    echo "当前模式: ${mode}"
-    echo "1) 切换为 全局模式"
-    echo "2) 切换为 分流模式"
-    echo "0) 返回上一级"
-    echo "========================================="
-    read -rp "请选择: " sub
-
-    case "$sub" in
-      1) enable_global_mode; echo "✅ 已切换为全局模式" ;;
-      2) enable_split_mode; echo "✅ 已切换为分流模式" ;;
-      0) break ;;
-      *) echo "❌ 无效选择" ;;
-    esac
-  done
-}
-
-show_status() {
-  echo "角色: $(get_role)"
-  echo "模式: $(get_current_mode)"
-  [[ -f "$WST_REMOTE_HOST_FILE" ]] && echo "远端主机: $(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_REMOTE_PORT_FILE" ]] && echo "远端端口: $(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_PATH_FILE" ]] && echo "路径前缀: $(cat "$WST_PATH_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_DOMAIN_FILE" ]] && echo "出口域名: $(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_WG_UDP_PORT_FILE" ]] && echo "WG UDP端口: $(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && echo "本地wstunnel UDP端口: $(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
+  echo "出口地址: ${exit_host}:${ws_port}"
+  echo "路径前缀: ${path_prefix}"
+  echo "=================================================="
   echo
-
-  wg show || true
-  echo
-  systemctl --no-pager --full status wstunnel-exit.service 2>/dev/null | sed -n '1,12p' || true
-  echo
-  systemctl --no-pager --full status wstunnel-entry.service 2>/dev/null | sed -n '1,12p' || true
-  echo
-  systemctl --no-pager --full status nginx 2>/dev/null | sed -n '1,12p' || true
-
-  if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
-    echo
-    echo "分流端口:"
-    cat "$PORT_LIST_FILE"
-  fi
-}
-
-start_wg() {
-  local role
-  role="$(get_role)"
-
-  if [[ "$role" == "exit" ]]; then
-    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
-    wg-quick up "${WG_IF}" 2>/dev/null || true
-    systemctl restart nginx 2>/dev/null || true
-    systemctl restart wstunnel-exit.service 2>/dev/null || true
-    echo "✅ 出口已启动"
-  elif [[ "$role" == "entry" ]]; then
-    systemctl restart wstunnel-entry.service 2>/dev/null || true
-    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
-    wg-quick up "${WG_IF}" 2>/dev/null || true
-    ensure_server_bypass_route
-    apply_current_mode
-    echo "✅ 入口已启动"
-  else
-    echo "❌ 还未配置角色"
-  fi
-}
-
-stop_wg() {
-  local role
-  role="$(get_role)"
-
-  if [[ "$role" == "exit" ]]; then
-    systemctl stop wstunnel-exit.service 2>/dev/null || true
-  elif [[ "$role" == "entry" ]]; then
-    systemctl stop wstunnel-entry.service 2>/dev/null || true
-  fi
-
-  wg-quick down "${WG_IF}" 2>/dev/null || true
-  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
-  clear_mark_rules
-  echo "✅ 已停止"
-}
-
-restart_wg() {
-  stop_wg
-  start_wg
-}
-
-update_wstunnel_entry_remote_ip() {
-  [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器"; return 1; }
-  ensure_dirs
-
-  local new_port verify_tls
-  local saved_port="" saved_path="" saved_verify="" local_udp_port="" remote_wg_udp_port=""
-  [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && local_udp_port="$(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_WG_UDP_PORT_FILE" ]] && remote_wg_udp_port="$(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
-
-  local new_host=""
-  while [[ -z "$new_host" ]]; do
-    read -rp "新出口域名 / IP: " new_host
-    [[ -z "$new_host" ]] && echo "❌ 出口地址不能为空"
-  done
-
-  read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
-  new_port="${new_port:-${saved_port:-443}}"
-
-  local new_path=""
-  while [[ -z "$new_path" ]]; do
-    if [[ -n "$saved_path" ]]; then
-      read -rp "请输入新的【路径前缀】(默认 ${saved_path}): " new_path
-      new_path="${new_path:-$saved_path}"
-    else
-      read -rp "请输入新的【路径前缀】: " new_path
-    fi
-    new_path="$(normalize_path_prefix "$new_path")"
-    [[ -z "$new_path" ]] && echo "❌ 路径前缀不能为空"
-  done
-
-  read -rp "是否严格校验证书? (默认 ${saved_verify:-Y}): " verify_tls
-  verify_tls="${verify_tls:-${saved_verify:-Y}}"
-  local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
-  remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
-
-  save_wst_params "$new_host" "$new_port" "$new_path" "$verify_tls"
-  ensure_server_bypass_route
-  setup_entry_wstunnel_service "$new_host" "$new_port" "$new_path" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
-
-  echo "✅ 已更新出口地址"
-  systemctl status wstunnel-entry.service --no-pager -l | sed -n '1,12p' || true
-}
-
-renew_cert_now() {
-  if [[ "$(get_role)" != "exit" ]]; then
-    echo "❌ 仅出口服务器可用"
-    return
-  fi
-  install_base_packages
-  certbot renew --nginx </dev/null
-  nginx -t && systemctl reload nginx
-  echo "✅ 证书续期执行完成"
 }
 
 uninstall_wg() {
-  echo "⏳ 正在彻底卸载并清理..."
+  local role
+  role="$(get_role)"
 
-  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
-  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null || true
-  wg-quick down "${WG_IF}" 2>/dev/null || true
+  echo "⏳ 正在彻底卸载并清理..."
 
   systemctl stop wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
   systemctl disable wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
   rm -f /etc/systemd/system/wstunnel-exit.service /etc/systemd/system/wstunnel-entry.service 2>/dev/null || true
   systemctl daemon-reload || true
 
+  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+
   ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
+  ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true
   clear_mark_rules
 
   if [[ -f "$PORT_LIST_FILE" ]]; then
@@ -1059,31 +999,35 @@ uninstall_wg() {
     done < "$PORT_LIST_FILE" || true
   fi
 
-  local site_file=""
-  if [[ -f "$WST_NGINX_SITE_FILE" ]]; then
-    site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null || true)"
-    [[ -n "${site_file:-}" ]] && rm -f "$site_file" "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")" 2>/dev/null || true
-  fi
+  iptables -t nat -S 2>/dev/null | grep "POSTROUTING -o ${WG_IF} -j MASQUERADE" | sed 's/^-A /-D /' | while read -r line; do
+    iptables -t nat $line 2>/dev/null || true
+  done
+  iptables -S FORWARD 2>/dev/null | grep "${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
+    iptables $line 2>/dev/null || true
+  done
+  iptables -t nat -S PREROUTING 2>/dev/null | grep "${WG_IF}\|DNAT" | sed 's/^-A /-D /' | while read -r line; do
+    iptables -t nat $line 2>/dev/null || true
+  done
 
-  local d=""
-  if [[ -f "$WST_DOMAIN_FILE" ]]; then
-    d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
-    [[ -n "${d:-}" ]] && rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
-    [[ -n "${d:-}" ]] && certbot delete --cert-name "$d" --non-interactive </dev/null 2>/dev/null || true
+  if [[ "$role" == "exit" || -f "$WST_DOMAIN_FILE" || -f "$WST_NGINX_SITE_FILE" ]]; then
+    local d=""
+    local site_file=""
+    [[ -f "$WST_DOMAIN_FILE" ]] && d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+    [[ -f "$WST_NGINX_SITE_FILE" ]] && site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null || true)"
+
+    [[ -n "$site_file" ]] && rm -f "$site_file" "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")" 2>/dev/null || true
+    [[ -n "$d" ]] && rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
+    [[ -n "$d" ]] && certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true
+
+    apt purge -y nginx nginx-common certbot python3-certbot-nginx >/dev/null 2>&1 || true
+    apt autoremove -y >/dev/null 2>&1 || true
   fi
 
   sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
   sysctl -p >/dev/null 2>&1 || true
 
-  nginx -t >/dev/null 2>&1 && systemctl reload nginx 2>/dev/null || true
-
-  if [[ -f "$INSTALLED_PKGS_FILE" ]]; then
-    mapfile -t pkgs_to_remove < <(grep -v '^[[:space:]]*$' "$INSTALLED_PKGS_FILE" 2>/dev/null | sort -u || true)
-    if [[ ${#pkgs_to_remove[@]} -gt 0 ]]; then
-      apt purge -y "${pkgs_to_remove[@]}" </dev/null 2>/dev/null || true
-      apt autoremove -y </dev/null 2>/dev/null || true
-    fi
-  fi
+  apt purge -y wireguard wireguard-tools >/dev/null 2>&1 || true
+  apt autoremove -y >/dev/null 2>&1 || true
 
   rm -rf "$WST_DIR" "$WG_DIR" 2>/dev/null || true
   rm -f "$WSTUNNEL_BIN" 2>/dev/null || true
@@ -1101,7 +1045,7 @@ while true; do
   echo "4) 启动"
   echo "5) 停止"
   echo "6) 重启"
-  echo "7) 卸载并清理（直接彻底删）"
+  echo "7) 卸载并清理"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP / 域名（仅入口）"
