@@ -334,10 +334,13 @@ EOF
 setup_entry_wstunnel_service() {
   local remote_host="$1" remote_port="$2" path_prefix="$3" verify_tls="$4" local_udp_port="$5" remote_wg_udp_port="$6"
   echo "$local_udp_port" > "$WST_LOCAL_UDP_PORT_FILE"
+  
   local verify_flag=""
   if [[ "$verify_tls" == "y" || "$verify_tls" == "Y" ]]; then
     verify_flag="--tls-verify-certificate"
   fi
+
+  # 🚨 终极修复点：彻底去除了 v10 报错的两个毒药参数 (--http-host-header 和 --websocket-ping-frequency-sec)
   cat >/etc/systemd/system/wstunnel-entry.service <<EOF
 [Unit]
 Description=wstunnel client
@@ -345,7 +348,7 @@ After=network-online.target
 Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=${WSTUNNEL_BIN} client -L udp://${local_udp_port}:127.0.0.1:${remote_wg_udp_port}?timeout_sec=0 --http-upgrade-path-prefix ${path_prefix} --http-host-header "${remote_host}" --websocket-ping-frequency-sec 25 ${verify_flag} wss://${remote_host}:${remote_port}
+ExecStart=${WSTUNNEL_BIN} client -L udp://${local_udp_port}:127.0.0.1:${remote_wg_udp_port}?timeout_sec=0 --http-upgrade-path-prefix ${path_prefix} ${verify_flag} wss://${remote_host}:${remote_port}
 Restart=on-failure
 RestartSec=2
 User=root
@@ -631,7 +634,7 @@ configure_exit() {
   
   local entry_public_key=""
   while [[ -z "$entry_public_key" ]]; do
-    read -rp "请输入【入口服务器公钥】(去入口服务器脚本里复制): " entry_public_key
+    read -rp "请输入【入口服务器公钥】(入口服务器复制): " entry_public_key
     [[ -z "$entry_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
   done
 
@@ -682,7 +685,7 @@ configure_entry() {
   
   local exit_host=""
   while [[ -z "$exit_host" ]]; do
-    read -rp "出口服务器域名/IP (如果是域名套了CDN也能连): " exit_host
+    read -rp "出口服务器域名/IP: " exit_host
     exit_host="${exit_host:-$saved_host}"
     [[ -z "$exit_host" ]] && echo "❌ 出口服务器地址不能为空，请重新输入！"
   done
@@ -690,14 +693,13 @@ configure_entry() {
   read -rp "wss 端口 (默认 ${saved_port:-443}): " ws_port
   ws_port="${ws_port:-${saved_port:-443}}"
   
-  # 🎯 彻底修复入口路径前缀逻辑，强制必填！
   local path_prefix=""
   while [[ -z "$path_prefix" ]]; do
     if [[ -n "$saved_path" ]]; then
-      read -rp "请输入【路径前缀】(必须去出口服务器复制，默认 ${saved_path}): " path_prefix
+      read -rp "请输入【路径前缀】(出口服务器复制，默认 ${saved_path}): " path_prefix
       path_prefix="${path_prefix:-$saved_path}"
     else
-      read -rp "请输入【路径前缀】(这是连接暗号，必须去出口服务器复制，千万别瞎填): " path_prefix
+      read -rp "请输入【路径前缀】(出口服务器复制): " path_prefix
     fi
     [[ -z "$path_prefix" ]] && echo "❌ 路径前缀是连接的暗号，绝不能留空，请重新输入！"
   done
@@ -714,7 +716,7 @@ configure_entry() {
   
   local exit_public_key=""
   while [[ -z "$exit_public_key" ]]; do
-    read -rp "请输入【出口服务器公钥】(去出口服务器脚本里复制): " exit_public_key
+    read -rp "请输入【出口服务器公钥】(出口服务器复制): " exit_public_key
     [[ -z "$exit_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
   done
 
@@ -841,14 +843,13 @@ update_wstunnel_entry_remote_ip() {
   read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
   new_port="${new_port:-${saved_port:-443}}"
 
-  # 🎯 修改配置时同样强制必填前缀
   local new_path=""
   while [[ -z "$new_path" ]]; do
     if [[ -n "$saved_path" ]]; then
-      read -rp "请输入新的【路径前缀】(必须去出口服务器复制，默认 ${saved_path}): " new_path
+      read -rp "请输入新的【路径前缀】(出口服务器复制，默认 ${saved_path}): " new_path
       new_path="${new_path:-$saved_path}"
     else
-      read -rp "请输入新的【路径前缀】(必须去出口服务器复制，千万别瞎填): " new_path
+      read -rp "请输入新的【路径前缀】(出口服务器复制): " new_path
     fi
     [[ -z "$new_path" ]] && echo "❌ 路径前缀不能为空！"
   done
