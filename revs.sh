@@ -8,21 +8,17 @@ SING_VERSION="1.13.5"
 
 PORT_LIST_FILE="${SING_DIR}/.ports"
 MODE_FILE="${SING_DIR}/.mode"
-EXIT_IP_FILE="${SING_DIR}/.exit_ip"
 ROLE_FILE="${SING_DIR}/.role"
 
 NGINX_SITE_DIR="/etc/nginx/sites-available"
 NGINX_SITE_ENABLED_DIR="/etc/nginx/sites-enabled"
 WEB_ROOT_BASE="/var/www"
 
-SING_SAFE_MTU=1320
-SING_DEFAULT_PORT=443
-
-ROUTE_TABLE_ID=51820
-
 SNI_LIST_FILE="${SING_DIR}/sni_list.txt"
 SNI_ROTATE_TIMER="/etc/systemd/system/sni-rotate.timer"
 SNI_ROTATE_SERVICE="/etc/systemd/system/sni-rotate.service"
+
+GITHUB_API_RELEASE="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SING_VERSION}"
 
 if [[ $EUID -ne 0 ]]; then
   echo "❌ 权限不足：请以 root 身份运行此脚本。"
@@ -46,7 +42,7 @@ rand_str() {
 detect_public_ip() {
   local ip=""
   for svc in "https://api.ipify.org" "https://ifconfig.me"; do
-    ip=$(curl -4 -fsS --max-time 3 "$svc" 2>/dev/null || true)
+    ip=$(curl -4 -fsS --max-time 5 "$svc" 2>/dev/null || true)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$ip"
       return 0
@@ -60,21 +56,18 @@ ensure_dirs() {
   chmod 700 "$SING_DIR"
 }
 
-get_wan_if() {
-  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || echo "eth0"
-}
-
 enable_ip_forward_global() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
-  sed -i '/net.ipv4.ip_forward/d' /etc/sysctl.conf 2>/dev/null || true
+  sed -i '/^[[:space:]]*net\.ipv4\.ip_forward[[:space:]]*=/d' /etc/sysctl.conf 2>/dev/null || true
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   sysctl -p >/dev/null 2>&1 || true
 }
 
 install_base_packages() {
   echo "[*] 安装基础依赖..."
+  export DEBIAN_FRONTEND=noninteractive
   apt-get update -yq
-  apt-get install -yq curl wget tar jq nginx certbot python3-certbot-nginx
+  apt-get install -yq curl wget tar jq nginx certbot python3-certbot-nginx ca-certificates openssl
 }
 
 ensure_server_bypass_route() {
@@ -103,14 +96,18 @@ get_random_sni() {
 
 rotate_client_sni() {
   [[ "$(get_role)" != "entry" ]] && { echo "❌ 此功能仅限入口服务器可用"; return; }
+
   echo "==== 手动切换客户端 SNI ===="
   local new_sni
   new_sni=$(get_random_sni)
   echo "[*] 正在切换至: $new_sni"
-  
+
   if [[ -f "${SING_DIR}/config.json" ]]; then
-    /usr/bin/jq --arg sni "$new_sni" '.outbounds[0].tls.server_name = $sni' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
+    jq --arg sni "$new_sni" '
+      (.outbounds[] | select(.tag=="reality-out") | .tls.server_name) = $sni
+    ' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
     mv "${SING_DIR}/config.json.tmp" "${SING_DIR}/config.json"
+    echo "$new_sni" > "${SING_DIR}/chosen_sni"
     systemctl restart singbox-entry.service
     echo "✅ SNI 切换成功！当前已生效: $new_sni"
   else
@@ -119,17 +116,29 @@ rotate_client_sni() {
 }
 
 setup_sni_rotation() {
-  echo "[*] 配置自动定时轮换机制 (Systemd Timer)..."
-  
+  echo "[*] 配置自动定时轮换机制 (systemd timer)..."
+
   cat > "${SING_DIR}/rotate.sh" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-new_sni=$(shuf -n 1 /etc/singbox/sni_list.txt)
-/usr/bin/jq --arg sni "$new_sni" '.outbounds[0].tls.server_name = $sni' /etc/singbox/config.json > /etc/singbox/config.json.tmp
-mv /etc/singbox/config.json.tmp /etc/singbox/config.json
+
+CFG="/etc/singbox/config.json"
+SNI_FILE="/etc/singbox/sni_list.txt"
+
+[[ -f "$CFG" ]] || exit 1
+[[ -f "$SNI_FILE" ]] || exit 1
+
+new_sni=$(shuf -n 1 "$SNI_FILE")
+
+jq --arg sni "$new_sni" '
+  (.outbounds[] | select(.tag=="reality-out") | .tls.server_name) = $sni
+' "$CFG" > "${CFG}.tmp"
+
+mv "${CFG}.tmp" "$CFG"
+echo "$new_sni" > /etc/singbox/chosen_sni
 systemctl restart singbox-entry.service
 EOF
-  
+
   chmod +x "${SING_DIR}/rotate.sh"
 
   cat > "$SNI_ROTATE_SERVICE" <<EOF
@@ -156,52 +165,137 @@ EOF
 
   systemctl daemon-reload
   systemctl enable --now sni-rotate.timer
-  echo "✅ SNI 定时轮换开启（每 6 小时触发一次，外加 30 分钟随机时间扰动）"
+  echo "✅ SNI 定时轮换开启（每 6 小时触发一次，附带最多 30 分钟随机延迟）"
 }
 
 install_singbox() {
-  echo "[*] 检查 sing-box Reality 核心..."
+  echo "[*] 检查 sing-box 核心..."
   if [[ -x "$SING_BIN" ]]; then
-    echo "[*] sing-box 已就绪"
+    echo "[*] sing-box 已就绪：$($SING_BIN version 2>/dev/null | head -n1 || true)"
     return 0
   fi
 
-  local arch file url_base url_bin url_sum tmpdir
+  local arch file tmpdir release_json release_url bin_url sum_url extracted_bin expected actual
   arch="$(uname -m)"
+
   case "$arch" in
     x86_64|amd64) file="sing-box-${SING_VERSION}-linux-amd64.tar.gz" ;;
     aarch64|arm64) file="sing-box-${SING_VERSION}-linux-arm64.tar.gz" ;;
-    *) echo "❌ 不支持的架构: $arch"; exit 1 ;;
+    armv7l|armv7) file="sing-box-${SING_VERSION}-linux-armv7.tar.gz" ;;
+    armv6l|armv6) file="sing-box-${SING_VERSION}-linux-armv6.tar.gz" ;;
+    i386|i686) file="sing-box-${SING_VERSION}-linux-386.tar.gz" ;;
+    s390x) file="sing-box-${SING_VERSION}-linux-s390x.tar.gz" ;;
+    riscv64) file="sing-box-${SING_VERSION}-linux-riscv64.tar.gz" ;;
+    loongarch64) file="sing-box-${SING_VERSION}-linux-loong64.tar.gz" ;;
+    *)
+      echo "❌ 不支持的架构: $arch"
+      exit 1
+      ;;
   esac
 
-  url_base="https://github.com/SagerNet/sing-box/releases/download/v${SING_VERSION}"
-  url_bin="${url_base}/${file}"
-  url_sum="${url_base}/sing-box-${SING_VERSION}-linux-amd64.tar.gz.sha256sum"
-
   tmpdir="$(mktemp -d)"
-  (
-    cd "$tmpdir"
-    echo "[*] 下载 sing-box ${SING_VERSION}..."
-    curl -L --fail "$url_bin" -o "$file"
-    curl -L --fail "$url_sum" -o checksums.txt
+  trap 'rm -rf "$tmpdir"' RETURN
 
-    echo "[*] 执行 SHA256 校验..."
-    if ! grep "$file" checksums.txt | sha256sum -c -; then
-      echo "❌ 致命错误：sing-box 二进制哈希校验失败！"
-      exit 1
-    fi
+  release_json="${tmpdir}/release.json"
 
-    tar -xzf "$file"
-    install -m 0755 sing-box "$SING_BIN"
+  echo "[*] 获取官方 release 资产列表..."
+  curl -fsSL \
+    -H "Accept: application/vnd.github+json" \
+    -H "User-Agent: sing-box-installer" \
+    "$GITHUB_API_RELEASE" \
+    -o "$release_json"
+
+  bin_url=$(
+    jq -r --arg name "$file" '
+      .assets[] | select(.name == $name) | .browser_download_url
+    ' "$release_json" | head -n1
   )
-  rm -rf "$tmpdir"
-  echo "✅ sing-box Reality 已安全安装"
+
+  sum_url=$(
+    jq -r '
+      .assets[]
+      | select(
+          (.name | test("sha256|sha256sum|checksums"; "i"))
+          and
+          (.name | test("\\.(txt|sum|sha256sum)$"; "i"))
+        )
+      | .browser_download_url
+    ' "$release_json" | head -n1
+  )
+
+  if [[ -z "${bin_url:-}" || "$bin_url" == "null" ]]; then
+    echo "❌ 未在官方 release 中找到二进制文件: $file"
+    exit 1
+  fi
+
+  if [[ -z "${sum_url:-}" || "$sum_url" == "null" ]]; then
+    echo "❌ 未在官方 release 中找到 SHA256 校验文件"
+    exit 1
+  fi
+
+  echo "[*] 下载 sing-box ${SING_VERSION}..."
+  curl -fL --retry 3 --connect-timeout 15 "$bin_url" -o "${tmpdir}/${file}"
+
+  echo "[*] 下载 SHA256 校验文件..."
+  curl -fL --retry 3 --connect-timeout 15 "$sum_url" -o "${tmpdir}/checksums.txt"
+
+  expected=$(
+    awk -v f="$file" '
+      $0 ~ f {
+        for (i=1; i<=NF; i++) {
+          if ($i ~ /^[A-Fa-f0-9]{64}$/) {
+            print tolower($i)
+            exit
+          }
+        }
+      }
+    ' "${tmpdir}/checksums.txt"
+  )
+
+  if [[ -z "${expected:-}" ]]; then
+    echo "❌ 在校验文件中未找到目标文件的 SHA256: $file"
+    echo "---- checksums.txt 内容预览 ----"
+    sed -n '1,30p' "${tmpdir}/checksums.txt" || true
+    echo "--------------------------------"
+    exit 1
+  fi
+
+  actual="$(sha256sum "${tmpdir}/${file}" | awk '{print tolower($1)}')"
+
+  echo "[*] 执行 SHA256 校验..."
+  if [[ "$actual" != "$expected" ]]; then
+    echo "❌ 致命错误：SHA256 校验失败"
+    echo "期望: $expected"
+    echo "实际: $actual"
+    exit 1
+  fi
+
+  echo "✅ SHA256 校验通过"
+
+  echo "[*] 解压文件..."
+  tar -xzf "${tmpdir}/${file}" -C "$tmpdir"
+
+  extracted_bin="$(find "$tmpdir" -type f -name sing-box | head -n1)"
+  if [[ -z "${extracted_bin:-}" ]]; then
+    echo "❌ 解压后未找到 sing-box 可执行文件"
+    exit 1
+  fi
+
+  install -m 0755 "$extracted_bin" "$SING_BIN"
+
+  if [[ ! -x "$SING_BIN" ]]; then
+    echo "❌ sing-box 安装失败"
+    exit 1
+  fi
+
+  echo "✅ sing-box 已安全安装：$($SING_BIN version 2>/dev/null | head -n1 || true)"
 }
 
 write_nginx_http_site_for_acme() {
   local domain="$1"
   local site_file="${NGINX_SITE_DIR}/${domain}.conf"
   local web_root="${WEB_ROOT_BASE}/${domain}"
+
   mkdir -p "$web_root"
 
   cat > "$site_file" <<EOF
@@ -209,13 +303,18 @@ server {
     listen 80;
     server_name ${domain};
     root ${web_root};
+
     location ^~ /.well-known/acme-challenge/ {
         default_type "text/plain";
         try_files \$uri =404;
     }
-    location / { return 301 https://\$host\$request_uri; }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 EOF
+
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
   nginx -t && systemctl restart nginx
 }
@@ -231,19 +330,59 @@ write_nginx_https_reality_site() {
   local web_root="${WEB_ROOT_BASE}/${domain}"
 
   mkdir -p "$web_root"
+
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>系统架构与研发笔记</title>
-<style>body{font-family:system-ui;margin:40px auto;max-width:860px;line-height:1.6;color:#333;}</style>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>生活随记</title>
+  <style>
+    body{
+      font-family:system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
+      margin:40px auto;
+      max-width:860px;
+      line-height:1.85;
+      color:#333;
+      padding:0 18px;
+      background:#fafafa;
+    }
+    h1,h2{color:#222}
+    .card{
+      background:#fff;
+      border:1px solid #eee;
+      border-radius:12px;
+      padding:20px;
+      margin-bottom:18px;
+      box-shadow:0 2px 10px rgba(0,0,0,.03);
+    }
+    .meta{
+      color:#888;
+      font-size:14px;
+    }
+  </style>
 </head>
 <body>
-<h1>后端架构与协议解析</h1>
-<p>记录微服务、容器化、网络协议（TCP/IP、Reality、Vision）实战经验。</p>
-<p>更新时间：2026年4月</p>
-<hr>
-<p>© 2026 All Rights Reserved. 内部技术文档。</p>
+  <h1>生活随记</h1>
+  <p class="meta">记录日常、见闻、城市角落和一些普通但真实的小事。</p>
+
+  <div class="card">
+    <h2>春天的傍晚</h2>
+    <p>最近天气慢慢暖起来，傍晚出门的时候，风里已经没有前些天那种明显的凉意。街边的小店陆续开着灯，路过便利店的时候，顺手买一瓶冰水，再慢慢走回去，感觉一天也就这样安静结束了。</p>
+  </div>
+
+  <div class="card">
+    <h2>随手记一顿晚饭</h2>
+    <p>有时候觉得，真正让人记住的并不是什么特别隆重的时刻，反而是下楼吃到一碗刚好的热汤面，或者在路边摊买到一份味道不错的小吃。普通日子里，这些细小的满足感反而更真实。</p>
+  </div>
+
+  <div class="card">
+    <h2>周末散步</h2>
+    <p>周末没有特意安排太多事，只是在附近走了走，看见有人遛狗、有人带着小孩买水果，也有人坐在路边发呆。城市大多数时候并不喧闹，更多是这种不紧不慢的节奏。</p>
+  </div>
+
+  <p class="meta">更新于 2026 年 4 月</p>
 </body>
 </html>
 EOF
@@ -255,8 +394,14 @@ EOF
 server {
     listen 80;
     server_name ${domain};
-    location ^~ /.well-known/acme-challenge/ { root ${web_root}; }
-    location / { return 301 https://\$host\$request_uri; }
+
+    location ^~ /.well-known/acme-challenge/ {
+        root ${web_root};
+    }
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 
 server {
@@ -269,8 +414,6 @@ server {
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
-    ssl_stapling on;
-    ssl_stapling_verify on;
 
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Content-Type-Options nosniff;
@@ -284,47 +427,58 @@ server {
     }
 
     location ^~ /${short_id} {
-        return 444; 
+        return 444;
     }
 }
 EOF
 
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
   nginx -t && systemctl restart nginx
-  echo "✅ 高保真静态伪装站已部署（Reality 隐藏在 443）"
+  echo "✅ 高保真静态伪装站已部署（生活随记）"
 }
 
 build_singbox_routes() {
   [[ ! -f "${SING_DIR}/config.json" ]] && return 0
-  
-  local mode="$(cat "$MODE_FILE" 2>/dev/null || echo "split")"
-  local ports_json="[]"
-  
+  [[ "$(get_role)" != "entry" ]] && return 0
+
+  local mode ports_json
+  mode="$(cat "$MODE_FILE" 2>/dev/null || echo "split")"
+  ports_json="[]"
+
   if [[ -f "$PORT_LIST_FILE" ]]; then
-    ports_json=$(awk 'NF && !/^#/{print int($1)}' "$PORT_LIST_FILE" | /usr/bin/jq -R . | /usr/bin/jq -s 'map(tonumber)')
+    ports_json=$(
+      awk 'NF && !/^#/{print int($1)}' "$PORT_LIST_FILE" |
+      jq -R . | jq -s 'map(select(length>0) | tonumber)'
+    )
     [[ -z "$ports_json" ]] && ports_json="[]"
   fi
 
   if [[ "$mode" == "global" ]]; then
-    /usr/bin/jq '.route.rules = [
-      {"port": [22], "outbound": "direct"},
-      {"inbound": ["tun-in"], "outbound": "reality-out"}
-    ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
+    jq '
+      .route.rules = [
+        {"port":[22],"outbound":"direct"},
+        {"inbound":["tun-in"],"outbound":"reality-out"}
+      ]
+    ' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
   else
     if [[ "$ports_json" == "[]" ]]; then
-      /usr/bin/jq '.route.rules = [
-        {"port": [22], "outbound": "direct"},
-        {"outbound": "direct"}
-      ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
+      jq '
+        .route.rules = [
+          {"port":[22],"outbound":"direct"},
+          {"outbound":"direct"}
+        ]
+      ' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
     else
-      /usr/bin/jq --argjson p "$ports_json" '.route.rules = [
-        {"port": [22], "outbound": "direct"},
-        {"inbound": ["tun-in"], "port": $p, "outbound": "reality-out"},
-        {"outbound": "direct"}
-      ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
+      jq --argjson p "$ports_json" '
+        .route.rules = [
+          {"port":[22],"outbound":"direct"},
+          {"inbound":["tun-in"],"port":$p,"outbound":"reality-out"},
+          {"outbound":"direct"}
+        ]
+      ' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
     fi
   fi
-  
+
   mv "${SING_DIR}/config.json.tmp" "${SING_DIR}/config.json"
 }
 
@@ -333,31 +487,52 @@ setup_exit_reality() {
 
   cat > "${SING_DIR}/config.json" <<EOF
 {
-  "log": {"level": "info"},
-  "inbounds": [{
-    "type": "vless",
-    "tag": "reality-in",
-    "listen": "::",
-    "listen_port": 443,
-    "users": [{"uuid": "${uuid}", "flow": "xtls-rprx-vision"}],
-    "tls": {
-      "enabled": true,
-      "server_name": "${domain}",
-      "reality": {
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "reality-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        {
+          "uuid": "${uuid}",
+          "flow": "xtls-rprx-vision"
+        }
+      ],
+      "tls": {
         "enabled": true,
-        "handshake": {
-          "server_opts": {
-            "server_names": ["${domain}"]
-          }
-        },
-        "private_key": "${private_key}",
-        "short_id": ["${short_id}"],
-        "dest": "127.0.0.1:8443"
+        "server_name": "${domain}",
+        "reality": {
+          "enabled": true,
+          "handshake": {
+            "server": "${domain}",
+            "server_port": 443
+          },
+          "private_key": "${private_key}",
+          "short_id": [
+            "${short_id}"
+          ]
+        }
       }
     }
-  }],
-  "outbounds": [{"type": "direct", "tag": "direct"}],
-  "route": {"rules": [{"inbound": "reality-in", "outbound": "direct"}]}
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": ["reality-in"],
+        "outbound": "direct"
+      }
+    ]
+  }
 }
 EOF
 
@@ -365,12 +540,15 @@ EOF
 [Unit]
 Description=sing-box Reality Exit (VLESS + Reality + Vision)
 After=network-online.target
+Wants=network-online.target
+
 [Service]
 Type=simple
 ExecStart=${SING_BIN} run -c ${SING_DIR}/config.json
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -385,17 +563,21 @@ setup_entry_reality() {
 
   cat > "${SING_DIR}/config.json" <<EOF
 {
-  "log": {"level": "info"},
-  "inbounds": [{
-    "type": "tun",
-    "tag": "tun-in",
-    "interface_name": "${SING_IF}",
-    "inet4_address": "172.19.0.1/30",
-    "auto_route": true,
-    "strict_route": true,
-    "sniff": true,
-    "stack": "system"
-  }],
+  "log": {
+    "level": "info"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "${SING_IF}",
+      "inet4_address": "172.19.0.1/30",
+      "auto_route": true,
+      "strict_route": true,
+      "sniff": true,
+      "stack": "system"
+    }
+  ],
   "outbounds": [
     {
       "type": "vless",
@@ -408,7 +590,10 @@ setup_entry_reality() {
       "tls": {
         "enabled": true,
         "server_name": "${chosen_sni}",
-        "utls": {"enabled": true, "fingerprint": "chrome"},
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
         "reality": {
           "enabled": true,
           "public_key": "${public_key}",
@@ -432,12 +617,15 @@ EOF
 [Unit]
 Description=sing-box Reality Entry Client (TUN + VLESS-Reality-Vision)
 After=network-online.target
+Wants=network-online.target
+
 [Service]
 Type=simple
 ExecStart=${SING_BIN} run -c ${SING_DIR}/config.json
 Restart=on-failure
 RestartSec=3
 LimitNOFILE=1048576
+
 [Install]
 WantedBy=multi-user.target
 EOF
@@ -451,7 +639,9 @@ get_current_mode() {
   [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" 2>/dev/null || echo "split"
 }
 
-set_mode_flag() { echo "$1" > "$MODE_FILE"; }
+set_mode_flag() {
+  echo "$1" > "$MODE_FILE"
+}
 
 enable_global_mode() {
   echo "[*] 切换为【全局模式】..."
@@ -507,7 +697,7 @@ configure_exit() {
   install_base_packages
   install_singbox
 
-  local domain short_id uuid private_key pub_ip
+  local domain short_id uuid private_key public_key pub_ip keypair
 
   pub_ip="$(detect_public_ip || true)"
   [[ -n "$pub_ip" ]] && echo "[*] 检测到公网 IP：$pub_ip"
@@ -517,11 +707,10 @@ configure_exit() {
 
   short_id="$(rand_str)"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
-  
-  local keypair
-  keypair=$(${SING_BIN} generate reality-keypair)
-  private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-  public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
+
+  keypair="$(${SING_BIN} generate reality-keypair)"
+  private_key="$(echo "$keypair" | awk '/PrivateKey/ {print $2}')"
+  public_key="$(echo "$keypair" | awk '/PublicKey/ {print $2}')"
 
   echo "$domain" > "${SING_DIR}/domain"
   echo "$short_id" > "${SING_DIR}/short_id"
@@ -531,7 +720,6 @@ configure_exit() {
   write_nginx_http_site_for_acme "$domain"
   issue_letsencrypt_cert "$domain"
   write_nginx_https_reality_site "$domain" "$short_id"
-
   setup_exit_reality "$domain" "$short_id" "$uuid" "$private_key"
 
   echo
@@ -558,12 +746,7 @@ configure_entry() {
   read -rp "public_key: " public_key
   read -rp "UUID: " uuid
 
-  chosen_sni=$(choose_sni)
-
-  read -rp "是否开启 SNI 自动定时轮换？(Y/n): " enable_rotate
-  if [[ "${enable_rotate,,}" == "y" || -z "$enable_rotate" ]]; then
-    setup_sni_rotation
-  fi
+  chosen_sni="$(choose_sni)"
 
   echo "$remote_host" > "${SING_DIR}/remote_host"
   echo "$short_id" > "${SING_DIR}/short_id"
@@ -572,6 +755,11 @@ configure_entry() {
   echo "$chosen_sni" > "${SING_DIR}/chosen_sni"
 
   setup_entry_reality "$remote_host" "$short_id" "$public_key" "$uuid" "$chosen_sni"
+
+  read -rp "是否开启 SNI 自动定时轮换？(Y/n): " enable_rotate
+  if [[ "${enable_rotate,,}" == "y" || -z "$enable_rotate" ]]; then
+    setup_sni_rotation
+  fi
 
   ensure_server_bypass_route
   set_mode_flag "split"
@@ -609,6 +797,8 @@ manage_entry_ports() {
             build_singbox_routes
             systemctl restart singbox-entry.service
           fi
+        else
+          echo "❌ 端口无效"
         fi
         ;;
       3)
@@ -625,13 +815,15 @@ manage_entry_ports() {
         fi
         ;;
       0) break ;;
+      *) echo "无效选项" ;;
     esac
   done
 }
 
 manage_entry_mode() {
   while true; do
-    local mode="$(get_current_mode)"
+    local mode
+    mode="$(get_current_mode)"
     echo "当前模式：$mode"
     echo "1) 切换为【全局模式】"
     echo "2) 切换为【端口分流模式】"
@@ -651,40 +843,61 @@ show_status() {
   echo "角色：$(get_role)"
   echo "模式：$(get_current_mode)"
   echo
+
   [[ -f "${SING_DIR}/remote_host" ]] && echo "出口地址：$(cat "${SING_DIR}/remote_host")"
+  [[ -f "${SING_DIR}/chosen_sni" ]] && echo "当前 SNI：$(cat "${SING_DIR}/chosen_sni")"
   echo
+
   echo "==== sing-box ===="
   systemctl --no-pager status singbox-exit.service 2>/dev/null | head -n 8 || true
   systemctl --no-pager status singbox-entry.service 2>/dev/null | head -n 8 || true
   echo
+
   echo "==== Nginx ===="
   systemctl --no-pager status nginx 2>/dev/null | head -n 6 || true
 }
 
-start_wg() {
+start_link() {
   echo "[*] 启动 Reality 链路..."
-  local role="$(get_role)"
+  local role
+  role="$(get_role)"
+
   if [[ "$role" == "exit" ]]; then
     systemctl restart singbox-exit.service nginx 2>/dev/null || true
   elif [[ "$role" == "entry" ]]; then
     systemctl restart singbox-entry.service 2>/dev/null || true
     apply_current_mode
+  else
+    echo "❌ 当前角色未知，请先执行配置"
   fi
 }
 
-stop_wg() {
+stop_link() {
   echo "[*] 停止 Reality 链路..."
   systemctl stop singbox-exit.service singbox-entry.service 2>/dev/null || true
 }
 
-restart_wg() { stop_wg; start_wg; }
+restart_link() {
+  stop_link
+  start_link
+}
 
 update_remote() {
   [[ "$(get_role)" != "entry" ]] && { echo "❌ 仅入口可用"; return; }
+
   echo "更新出口地址..."
   read -rp "新出口域名/IP: " new_host
+  [[ -z "$new_host" ]] && { echo "❌ 不能为空"; return; }
+
   echo "$new_host" > "${SING_DIR}/remote_host"
-  build_singbox_routes
+
+  if [[ -f "${SING_DIR}/config.json" ]]; then
+    jq --arg host "$new_host" '
+      (.outbounds[] | select(.tag=="reality-out") | .server) = $host
+    ' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
+    mv "${SING_DIR}/config.json.tmp" "${SING_DIR}/config.json"
+  fi
+
   systemctl restart singbox-entry.service
   echo "✅ 已更新"
 }
@@ -698,13 +911,19 @@ renew_cert_now() {
 uninstall() {
   read -rp "确认彻底卸载 Reality？(y/N): " confirm
   [[ ! "$confirm" =~ ^[yY]$ ]] && return
+
   systemctl stop singbox-exit.service singbox-entry.service nginx 2>/dev/null || true
   systemctl disable singbox-exit.service singbox-entry.service sni-rotate.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/singbox-*.service /etc/systemd/system/sni-rotate.*
-  rm -rf "$SING_DIR" "$SING_BIN"
-  apt remove -y wireguard wireguard-tools 2>/dev/null || true
+
+  rm -f /etc/systemd/system/singbox-*.service
+  rm -f /etc/systemd/system/sni-rotate.service /etc/systemd/system/sni-rotate.timer
+
+  systemctl daemon-reload
+
+  rm -rf "$SING_DIR"
+  rm -f "$SING_BIN"
+
   echo "✅ Reality 已彻底清理"
-  rm -f "$0"
   exit 0
 }
 
@@ -731,9 +950,9 @@ while true; do
     1) configure_exit ;;
     2) configure_entry ;;
     3) show_status ;;
-    4) start_wg ;;
-    5) stop_wg ;;
-    6) restart_wg ;;
+    4) start_link ;;
+    5) stop_link ;;
+    6) restart_link ;;
     7) uninstall ;;
     8) [[ "$(get_role)" == "entry" ]] && manage_entry_ports || echo "❌ 仅入口可用" ;;
     9) [[ "$(get_role)" == "entry" ]] && manage_entry_mode || echo "❌ 仅入口可用" ;;
