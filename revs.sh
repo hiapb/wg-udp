@@ -99,6 +99,7 @@ install_base_packages() {
   cmd_exists nginx || pkgs+=("nginx")
   cmd_exists certbot || pkgs+=("certbot")
   cmd_exists openssl || pkgs+=("openssl")
+  cmd_exists ip || pkgs+=("iproute2")
 
   if ! dpkg -s python3-certbot-nginx >/dev/null 2>&1; then
     pkgs+=("python3-certbot-nginx")
@@ -604,10 +605,12 @@ setup_entry_reality() {
       "type": "tun",
       "tag": "tun-in",
       "interface_name": "${SING_IF}",
-      "inet4_address": "172.19.0.1/30",
+      "address": [
+        "172.19.0.1/30"
+      ],
       "auto_route": true,
       "strict_route": true,
-      "sniff": true,
+      "auto_redirect": true,
       "stack": "system"
     }
   ],
@@ -1050,7 +1053,7 @@ uninstall() {
   echo "[*] 清理残留临时文件..."
   rm -f /tmp/sing-box*.tar.gz /tmp/sing-box*.tmp 2>/dev/null || true
 
-  echo "✅ 已彻底卸载：sing-box / nginx / certbot 已删除"
+  echo "✅ 已彻底卸载：sing-box / nginx / certbot 已删除，curl 与 jq 保留"
   exit 0
 }
 
@@ -1063,7 +1066,7 @@ while true; do
   echo "4) 启动"
   echo "5) 停止"
   echo "6) 重启"
-  echo "7) 卸载并清理"
+  echo "7) 卸载并清理（含 nginx / certbot）"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP / 域名"
