@@ -47,6 +47,7 @@ set_role() {
   echo "$role" > "$ROLE_FILE"
 }
 
+
 rand_str() {
   tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24 || true
 }
