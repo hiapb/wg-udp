@@ -756,7 +756,7 @@ restart_wg() {
 update_wstunnel_entry_remote_ip() {
   [[ "$(get_role)" == "entry" ]] || { echo "❌ 当前机器不是入口服务器"; return 1; }
 
-  local saved_port="" saved_path="" saved_verify="" local_udp_port="" remote_wg_udp_port=""
+  local saved_port="" saved_path="" saved_verify="" local_udp_port="" remote_wg_udp_port="" new_port verify_tls
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
   [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
@@ -974,51 +974,71 @@ configure_entry() {
 
 uninstall_wg() {
   local role
-  role="$(get_role)"
+  role="$(get_role 2>/dev/null || echo unknown)"
 
   echo "⏳ 正在彻底卸载并清理..."
 
-  systemctl stop wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
-  systemctl disable wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
-  rm -f /etc/systemd/system/wstunnel-exit.service /etc/systemd/system/wstunnel-entry.service 2>/dev/null || true
-  systemctl daemon-reload || true
+  set +e
 
-  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
-  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null || true
-  wg-quick down "${WG_IF}" 2>/dev/null || true
+  systemctl stop wstunnel-exit.service 2>/dev/null
+  systemctl stop wstunnel-entry.service 2>/dev/null
+  systemctl disable wstunnel-exit.service 2>/dev/null
+  systemctl disable wstunnel-entry.service 2>/dev/null
+  rm -f /etc/systemd/system/wstunnel-exit.service /etc/systemd/system/wstunnel-entry.service
+  systemctl daemon-reload 2>/dev/null || true
 
-  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
-  ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true
-  clear_mark_rules
+  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null
+  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null
+  wg-quick down "${WG_IF}" 2>/dev/null
+
+  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null
+  ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null
+
+  clear_mark_rules 2>/dev/null || true
 
   if [[ -f "$PORT_LIST_FILE" ]]; then
     while read -r p; do
       [[ -z "$p" ]] && continue
-      remove_forward_port_mapping "$p"
-      remove_port_iptables_rules "$p"
-    done < "$PORT_LIST_FILE" || true
+      remove_forward_port_mapping "$p" 2>/dev/null || true
+      remove_port_iptables_rules "$p" 2>/dev/null || true
+    done < "$PORT_LIST_FILE"
   fi
 
-  iptables -t nat -S 2>/dev/null | grep "POSTROUTING -o ${WG_IF} -j MASQUERADE" | sed 's/^-A /-D /' | while read -r line; do
+  iptables -t nat -S PREROUTING 2>/dev/null | grep -E "DNAT|${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
     iptables -t nat $line 2>/dev/null || true
   done
-  iptables -S FORWARD 2>/dev/null | grep "${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
+
+  iptables -t nat -S POSTROUTING 2>/dev/null | grep -E "${WG_IF}|MASQUERADE" | sed 's/^-A /-D /' | while read -r line; do
+    iptables -t nat $line 2>/dev/null || true
+  done
+
+  iptables -S FORWARD 2>/dev/null | grep -E "${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
     iptables $line 2>/dev/null || true
   done
-  iptables -t nat -S PREROUTING 2>/dev/null | grep "${WG_IF}\|DNAT" | sed 's/^-A /-D /' | while read -r line; do
-    iptables -t nat $line 2>/dev/null || true
-  done
+
+  rm -f "$WSTUNNEL_BIN"
 
   if [[ "$role" == "exit" || -f "$WST_DOMAIN_FILE" || -f "$WST_NGINX_SITE_FILE" ]]; then
     local d=""
     local site_file=""
-    [[ -f "$WST_DOMAIN_FILE" ]] && d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
-    [[ -f "$WST_NGINX_SITE_FILE" ]] && site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null || true)"
 
-    [[ -n "$site_file" ]] && rm -f "$site_file" "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")" 2>/dev/null || true
-    [[ -n "$d" ]] && rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
-    [[ -n "$d" ]] && certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true
+    [[ -f "$WST_DOMAIN_FILE" ]] && d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null)"
+    [[ -f "$WST_NGINX_SITE_FILE" ]] && site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null)"
 
+    if [[ -n "$site_file" ]]; then
+      rm -f "$site_file"
+      rm -f "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")"
+    fi
+
+    if [[ -n "$d" ]]; then
+      rm -rf "${WEB_ROOT_BASE}/${d}"
+      certbot delete --cert-name "$d" --non-interactive >/dev/null 2>&1 || true
+      rm -rf "/etc/letsencrypt/live/${d}" \
+             "/etc/letsencrypt/archive/${d}" \
+             "/etc/letsencrypt/renewal/${d}.conf" 2>/dev/null
+    fi
+
+    systemctl stop nginx 2>/dev/null
     apt purge -y nginx nginx-common certbot python3-certbot-nginx >/dev/null 2>&1 || true
     apt autoremove -y >/dev/null 2>&1 || true
   fi
@@ -1030,9 +1050,10 @@ uninstall_wg() {
   apt autoremove -y >/dev/null 2>&1 || true
 
   rm -rf "$WST_DIR" "$WG_DIR" 2>/dev/null || true
-  rm -f "$WSTUNNEL_BIN" 2>/dev/null || true
 
   echo "✅ 已彻底清理完成"
+
+  set -e
   exit 0
 }
 
