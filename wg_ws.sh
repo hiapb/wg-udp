@@ -247,20 +247,85 @@ write_nginx_https_wstunnel_site() {
 
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>日常随笔</title>
-<style>body{font-family:'PingFang SC','Microsoft YaHei',sans-serif;margin:40px auto;max-width:700px;line-height:1.8;color:#444;padding:0 20px;}h1{color:#222;font-weight:normal}.date{color:#999;font-size:.9em;margin-bottom:30px}p{margin-bottom:20px}hr{border:0;border-top:1px solid #eee;margin:50px 0}footer{color:#aaa;font-size:.8em;text-align:center}</style>
+<title>Global Network Speed Test</title>
+<style>
+    :root { --bg: #0d1117; --surface: #161b22; --border: #30363d; --text: #c9d1d9; --text-muted: #8b949e; --primary: #58a6ff; --success: #238636; --success-hover: #2ea043; }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background-color: var(--bg); color: var(--text); display: flex; align-items: center; justify-content: center; min-height: 100vh; }
+    .card { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 40px; width: 100%; max-width: 480px; box-shadow: 0 8px 24px rgba(0,0,0,0.4); text-align: center; }
+    h1 { font-size: 24px; font-weight: 600; margin-bottom: 8px; color: #fff; }
+    p.desc { font-size: 14px; color: var(--text-muted); margin-bottom: 32px; }
+    .progress-track { width: 100%; height: 6px; background: var(--border); border-radius: 3px; overflow: hidden; margin-bottom: 32px; display: none; }
+    .progress-fill { width: 0%; height: 100%; background: var(--primary); transition: width 0.1s linear; }
+    .metrics-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 32px; }
+    .metric-box { background: rgba(255,255,255,0.02); border: 1px solid var(--border); border-radius: 8px; padding: 16px 8px; }
+    .metric-label { font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--text-muted); display: block; margin-bottom: 8px; }
+    .metric-value { font-size: 20px; font-weight: 600; color: #fff; font-variant-numeric: tabular-nums; }
+    .metric-unit { font-size: 12px; font-weight: 400; color: var(--text-muted); }
+    .btn { background: var(--success); color: #fff; border: none; width: 100%; padding: 14px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: background 0.2s; }
+    .btn:hover { background: var(--success-hover); }
+    .btn:disabled { background: var(--border); color: var(--text-muted); cursor: not-allowed; }
+</style>
 </head>
 <body>
-<h1>春日漫无目的散步</h1>
-<p class="date">2026年4月</p>
-<p>周末难得是个大晴天，没有定闹钟，睡到自然醒。下楼顺着街边一直往前走，没开导航，就是想随便看看平时匆匆路过的风景。</p>
-<p>在转角的一家老旧咖啡馆坐了一个下午，看书，发呆，听隔壁桌聊着琐碎的生活日常。阳光打在木桌上，光影拉得很长。</p>
-<hr>
-<footer>© 2026 个人碎碎念</footer>
+<div class="card">
+    <h1>Edge Speed Test</h1>
+    <p class="desc">Verify connection quality to the nearest edge node.</p>
+    
+    <div class="progress-track" id="pb"><div class="progress-fill" id="pf"></div></div>
+    
+    <div class="metrics-grid">
+        <div class="metric-box">
+            <span class="metric-label">Ping</span>
+            <span class="metric-value" id="ping">--</span> <span class="metric-unit">ms</span>
+        </div>
+        <div class="metric-box">
+            <span class="metric-label">Download</span>
+            <span class="metric-value" id="dl">--</span> <span class="metric-unit">Mbps</span>
+        </div>
+        <div class="metric-box">
+            <span class="metric-label">Upload</span>
+            <span class="metric-value" id="ul">--</span> <span class="metric-unit">Mbps</span>
+        </div>
+    </div>
+    
+    <button class="btn" id="startBtn" onclick="runDiagnostics()">Start Diagnostics</button>
+</div>
+
+<script>
+function runDiagnostics() {
+    const btn = document.getElementById('startBtn');
+    const pb = document.getElementById('pb');
+    const pf = document.getElementById('pf');
+    const els = { ping: document.getElementById('ping'), dl: document.getElementById('dl'), ul: document.getElementById('ul') };
+    
+    btn.disabled = true;
+    btn.innerText = 'Analyzing...';
+    Object.values(els).forEach(e => e.innerText = '--');
+    pb.style.display = 'block';
+    
+    let tick = 0;
+    const timer = setInterval(() => {
+        tick++;
+        pf.style.width = tick + '%';
+        
+        if (tick === 15) els.ping.innerText = (Math.random() * 15 + 8).toFixed(1);
+        if (tick > 15 && tick < 55) els.dl.innerText = (Math.random() * 80 + 150).toFixed(1);
+        if (tick > 55 && tick < 95) els.ul.innerText = (Math.random() * 40 + 60).toFixed(1);
+        
+        if (tick >= 100) {
+            clearInterval(timer);
+            btn.disabled = false;
+            btn.innerText = 'Run Again';
+            setTimeout(() => pb.style.display = 'none', 500);
+        }
+    }, 40);
+}
+</script>
 </body>
 </html>
 EOF
@@ -831,15 +896,75 @@ update_wstunnel_entry_remote_ip() {
 }
 
 renew_cert_now() {
-  if [[ "$(get_role)" != "exit" ]]; then
-    print_err "仅出口服务器可用"
-    return
-  fi
-  print_block "⏳ 正在续期证书"
+  print_block "⏳ 正在手动续期证书"
   install_base_packages
   certbot renew --nginx >/dev/null 2>&1 || true
   nginx -t >/dev/null && systemctl reload nginx
   print_ok "证书续期执行完成"
+}
+
+manage_certificates() {
+  if [[ "$(get_role)" != "exit" ]]; then
+    print_err "仅出口服务器可用"
+    return
+  fi
+
+  local domain=""
+  if [[ -f "$WST_DOMAIN_FILE" ]]; then
+    domain="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+  fi
+
+  while true; do
+    print_block "证书管理（仅出口）"
+    echo "当前绑定域名: ${domain:-未配置}"
+    echo "1) 查看证书情况"
+    echo "2) 开启自动续签"
+    echo "3) 关闭自动续签"
+    echo "4) 手动立即续签"
+    echo "5) 删除证书"
+    echo "0) 返回上一级"
+    read -rp "请选择: " sub
+
+    case "$sub" in
+      1)
+        if [[ -n "$domain" ]] && [[ -d "/etc/letsencrypt/live/${domain}" ]]; then
+          echo "✅ 检测到 ${domain} 的有效证书信息："
+          certbot certificates -d "$domain" 2>/dev/null | grep -E "Expiry Date|Certificate Path|Private Key Path" || true
+        else
+          print_warn "未检测到有效证书"
+        fi
+        ;;
+      2)
+        systemctl enable certbot.timer >/dev/null 2>&1 || true
+        systemctl start certbot.timer >/dev/null 2>&1 || true
+        print_ok "已开启自动续签定时任务 (certbot.timer)"
+        ;;
+      3)
+        systemctl disable certbot.timer >/dev/null 2>&1 || true
+        systemctl stop certbot.timer >/dev/null 2>&1 || true
+        print_ok "已关闭自动续签定时任务 (certbot.timer)"
+        ;;
+      4)
+        renew_cert_now
+        ;;
+      5)
+        if [[ -n "$domain" ]]; then
+          read -rp "⚠️ 确定要删除 ${domain} 的证书吗？会导致服务中断 (y/N): " confirm
+          if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
+            rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
+            print_ok "证书已成功删除"
+          else
+            echo "已取消删除操作"
+          fi
+        else
+          print_warn "未找到绑定的域名，无法删除"
+        fi
+        ;;
+      0) break ;;
+      *) print_err "无效选择" ;;
+    esac
+  done
 }
 
 configure_exit() {
@@ -1202,7 +1327,7 @@ while true; do
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP / 域名（仅入口）"
-  echo "11) 手动执行证书续期（仅出口）"
+  echo "11) 证书管理（仅出口）"
   echo "0) 退出"
   echo "====================================================================="
   read -rp "请选择: " choice
@@ -1218,7 +1343,7 @@ while true; do
     8) manage_entry_ports ;;
     9) manage_entry_mode ;;
     10) update_wstunnel_entry_remote_ip ;;
-    11) renew_cert_now ;;
+    11) manage_certificates ;;
     0) exit 0 ;;
     *) print_err "无效选择" ;;
   esac
