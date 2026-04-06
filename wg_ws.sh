@@ -48,7 +48,7 @@ set_role() {
 }
 
 rand_str() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
+  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24 || true
 }
 
 detect_public_ip() {
@@ -65,7 +65,7 @@ detect_public_ip() {
 
 resolve_ipv4() {
   local host="$1"
-  getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}'
+  getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}' || true
 }
 
 ensure_dirs() {
@@ -75,12 +75,12 @@ ensure_dirs() {
 
 get_wan_if() {
   local wan
-  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 | grep -v '^$')
+  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 | (grep -v '^$' || true))
   echo "${wan:-eth0}"
 }
 
 get_main_gateway() {
-  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}'
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}' || true
 }
 
 enable_ip_forward_global() {
@@ -170,7 +170,6 @@ install_wstunnel() {
   esac
   url_base="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}"
   url_bin="${url_base}/${file}"
-  # ❗ 修复了这里：GitHub上实际的校验文件名就是 checksums.txt
   url_sum="${url_base}/checksums.txt"
   tmpdir="$(mktemp -d)"
   
@@ -190,7 +189,7 @@ install_wstunnel() {
        exit 1
     fi
     tar -xzf "$file"
-    bin_name="$(find . -maxdepth 1 -type f \( -name "wstunnel" -o -name "wstunnel-cli" \) | head -n1)"
+    bin_name="$(find . -maxdepth 1 -type f \( -name "wstunnel" -o -name "wstunnel-cli" \) 2>/dev/null | head -n1 || true)"
     install -m 0755 "$bin_name" "$WSTUNNEL_BIN"
   ) || exit 1
   rm -rf "$tmpdir"
@@ -432,8 +431,10 @@ EOF
 
 clear_mark_rules() {
   for chain in OUTPUT PREROUTING; do
-    iptables -t mangle -S "$chain" 2>/dev/null | grep " MARK " | sed 's/^-A /-D /' | while read -r line; do
-      iptables -t mangle $line 2>/dev/null || true
+    iptables -t mangle -S "$chain" 2>/dev/null | (grep " MARK " || true) | sed 's/^-A /-D /' | while read -r line; do
+      if [[ -n "$line" ]]; then
+        iptables -t mangle $line 2>/dev/null || true
+      fi
     done
   done
 }
@@ -446,7 +447,7 @@ set_mode_flag() { echo "$1" > "$MODE_FILE"; }
 
 ensure_policy_routing_for_ports() {
   if ! ip link show "${WG_IF}" &>/dev/null; then return 0; fi
-  if ! ip rule show | grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}"; then ip rule add fwmark 0x1 lookup ${ROUTE_TABLE_ID}; fi
+  if ! ip rule show | (grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}" || true); then ip rule add fwmark 0x1 lookup ${ROUTE_TABLE_ID}; fi
   ip route replace default dev "${WG_IF}" table ${ROUTE_TABLE_ID}
   ensure_server_bypass_route
 }
@@ -473,7 +474,7 @@ add_port_to_list() {
   local port="$1"
   mkdir -p "$(dirname "$PORT_LIST_FILE")"
   touch "$PORT_LIST_FILE"
-  if grep -qx "$port" "$PORT_LIST_FILE"; then
+  if (grep -qx "$port" "$PORT_LIST_FILE" || true); then
     return 0
   fi
   echo "$port" >> "$PORT_LIST_FILE"
@@ -482,7 +483,7 @@ add_port_to_list() {
 remove_port_from_list() {
   local port="$1"
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
-  if ! grep -qx "$port" "$PORT_LIST_FILE"; then
+  if ! (grep -qx "$port" "$PORT_LIST_FILE" || true); then
     return 0
   fi
   sed -i "\|^$port$|d" "$PORT_LIST_FILE"
@@ -601,20 +602,24 @@ configure_exit() {
   install_base_packages
   install_wireguard
   install_wstunnel
-  local pub_ip_detected domain wg_addr entry_wg_ip out_if
-  local entry_public_key ws_port path_prefix default_if
+  local pub_ip_detected wg_addr entry_wg_ip out_if
+  local ws_port path_prefix default_if
   local wg_udp_port backend_port
   pub_ip_detected="$(detect_public_ip || true)"
-  read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
-  if [[ -z "$domain" ]]; then
-    return
-  fi
+  
+  # 强制必填：域名
+  local domain=""
+  while [[ -z "$domain" ]]; do
+    read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
+    [[ -z "$domain" ]] && echo "❌ 域名不能为空，请重新输入！"
+  done
   echo "$domain" > "$WST_DOMAIN_FILE"
+  
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " wg_addr
   wg_addr="${wg_addr:-10.0.0.1/24}"
   read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/32): " entry_wg_ip
   entry_wg_ip="${entry_wg_ip:-10.0.0.2/32}"
-  default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 || true)
   read -rp "出口服务器对外网卡名(默认 ${default_if:-eth0}): " out_if
   out_if="${out_if:-${default_if:-eth0}}"
   read -rp "Nginx/WSS 对外端口 (默认 443): " ws_port
@@ -622,14 +627,21 @@ configure_exit() {
   read -rp "出口服务器 WG 真正监听 UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " wg_udp_port
   wg_udp_port="${wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
   backend_port=$((RANDOM % 1000 + 30000))
-  local recommended_path="static/assets/img_$(rand_str | head -c 6)"
+  local recommended_path="static/assets/img_$(rand_str || echo "abc1234")"
   read -rp "WebSocket 路径前缀/密钥 (默认 ${recommended_path}): " path_prefix
   path_prefix="${path_prefix:-${recommended_path}}"
+  
   write_nginx_http_site_for_acme "$domain"
   issue_letsencrypt_cert "$domain"
   write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix"
-  read -rp "请输入【入口服务器公钥】: " entry_public_key
-  entry_public_key="${entry_public_key:-CHANGE_ME_ENTRY_PUBLIC_KEY}"
+  
+  # 强制必填：入口服务器公钥
+  local entry_public_key=""
+  while [[ -z "$entry_public_key" ]]; do
+    read -rp "请输入【入口服务器公钥】: " entry_public_key
+    [[ -z "$entry_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
+  done
+
   configure_exit_wg "$wg_addr" "$entry_wg_ip" "$entry_public_key" "$out_if" "$wg_udp_port"
   setup_exit_wstunnel_service "$backend_port" "$path_prefix" "$wg_udp_port"
   save_wst_params "$domain" "$ws_port" "$path_prefix" "y"
@@ -641,14 +653,16 @@ configure_entry() {
   install_base_packages
   install_wireguard
   install_wstunnel
-  local wg_addr exit_wg_ip exit_public_key
-  local exit_host ws_port path_prefix verify_tls
+  local wg_addr exit_wg_ip 
+  local ws_port path_prefix verify_tls
   local local_udp_port remote_wg_udp_port
   local saved_host saved_port saved_path saved_verify
+  
   read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/24): " wg_addr
   wg_addr="${wg_addr:-10.0.0.2/24}"
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/32): " exit_wg_ip
   exit_wg_ip="${exit_wg_ip:-10.0.0.1/32}"
+  
   saved_host=""
   saved_port=""
   saved_path=""
@@ -657,25 +671,40 @@ configure_entry() {
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
   [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
-  read -rp "出口服务器域名 / IP (默认 ${saved_host:-}): " exit_host
-  exit_host="${exit_host:-$saved_host}"
+  
+  # 强制必填：出口服务器域名
+  local exit_host=""
+  while [[ -z "$exit_host" ]]; do
+    read -rp "出口服务器域名 / IP (默认 ${saved_host:-}): " exit_host
+    exit_host="${exit_host:-$saved_host}"
+    [[ -z "$exit_host" ]] && echo "❌ 出口服务器地址不能为空，请重新输入！"
+  done
+
   read -rp "wss 端口 (默认 ${saved_port:-443}): " ws_port
   ws_port="${ws_port:-${saved_port:-443}}"
   read -rp "路径前缀 (默认 ${saved_path:-自动生成}): " path_prefix
-  path_prefix="${path_prefix:-${saved_path:-$(rand_str)}}"
+  path_prefix="${path_prefix:-${saved_path:-$(rand_str || echo "v1")}}"
   read -rp "是否严格校验证书? (Y/n，正式域名证书建议 Y): " verify_tls
   verify_tls="${verify_tls:-Y}"
   read -rp "入口本地 wstunnel 监听 UDP 端口 (默认 ${WST_LOCAL_UDP_PORT_DEFAULT}): " local_udp_port
   local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
   read -rp "远端出口 WG UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " remote_wg_udp_port
   remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+  
   save_wst_params "$exit_host" "$ws_port" "$path_prefix" "$verify_tls"
   setup_entry_wstunnel_service "$exit_host" "$ws_port" "$path_prefix" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
+  
   if [[ -f "${WG_DIR}/entry_public.key" ]]; then
     cat "${WG_DIR}/entry_public.key" 2>/dev/null || true
   fi
-  read -rp "请输入【出口服务器公钥】: " exit_public_key
-  exit_public_key="${exit_public_key:-CHANGE_ME_EXIT_PUBLIC_KEY}"
+  
+  # 强制必填：出口服务器公钥
+  local exit_public_key=""
+  while [[ -z "$exit_public_key" ]]; do
+    read -rp "请输入【出口服务器公钥】: " exit_public_key
+    [[ -z "$exit_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
+  done
+
   configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
   ensure_server_bypass_route
   ensure_policy_routing_for_ports
@@ -782,14 +811,21 @@ restart_wg() {
 update_wstunnel_entry_remote_ip() {
   [[ "$(get_role)" == "entry" ]] || return 1
   ensure_dirs
-  local new_host new_port new_path verify_tls
+  local new_port new_path verify_tls
   local saved_port saved_path saved_verify local_udp_port remote_wg_udp_port
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
   [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
   [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && local_udp_port="$(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_WG_UDP_PORT_FILE" ]] && remote_wg_udp_port="$(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
-  read -rp "新出口域名 / IP: " new_host
+  
+  # 强制必填：修改时的出口地址
+  local new_host=""
+  while [[ -z "$new_host" ]]; do
+    read -rp "新出口域名 / IP: " new_host
+    [[ -z "$new_host" ]] && echo "❌ 出口地址不能为空，请重新输入！"
+  done
+
   read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
   new_port="${new_port:-${saved_port:-443}}"
   read -rp "路径前缀 (默认 ${saved_path:-v1}): " new_path
@@ -798,6 +834,7 @@ update_wstunnel_entry_remote_ip() {
   verify_tls="${verify_tls:-${saved_verify:-Y}}"
   local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
   remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+  
   save_wst_params "$new_host" "$new_port" "$new_path" "$verify_tls"
   ensure_server_bypass_route
   setup_entry_wstunnel_service "$new_host" "$new_port" "$new_path" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
