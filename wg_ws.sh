@@ -1,28 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SING_IF="tun0"
-SING_DIR="/etc/singbox"
-SING_BIN="/usr/local/bin/sing-box"
-SING_VERSION="1.13.5"
-
-PORT_LIST_FILE="${SING_DIR}/.ports"
-MODE_FILE="${SING_DIR}/.mode"
-EXIT_IP_FILE="${SING_DIR}/.exit_ip"
-ROLE_FILE="${SING_DIR}/.role"
-
+WG_IF="wg0"
+WG_DIR="/etc/wireguard"
+PORT_LIST_FILE="${WG_DIR}/.wg_ports"
+MODE_FILE="${WG_DIR}/.wg_mode"
+EXIT_WG_IP_FILE="${WG_DIR}/.exit_wg_ip"
+ROLE_FILE="${WG_DIR}/.wg_role"
+WST_DIR="/etc/wstunnel"
+WSTUNNEL_BIN="/usr/local/bin/wstunnel"
+WSTUNNEL_VERSION="10.5.2"
+WST_REMOTE_HOST_FILE="${WST_DIR}/remote_host"
+WST_REMOTE_PORT_FILE="${WST_DIR}/remote_port"
+WST_PATH_FILE="${WST_DIR}/path_prefix"
+WST_VERIFY_FILE="${WST_DIR}/verify_tls"
+WST_DOMAIN_FILE="${WST_DIR}/domain"
+WST_NGINX_SITE_FILE="${WST_DIR}/nginx_site"
+WST_WG_UDP_PORT_FILE="${WST_DIR}/wg_udp_port"
+WST_LOCAL_UDP_PORT_FILE="${WST_DIR}/local_udp_port"
 NGINX_SITE_DIR="/etc/nginx/sites-available"
 NGINX_SITE_ENABLED_DIR="/etc/nginx/sites-enabled"
 WEB_ROOT_BASE="/var/www"
-
-SING_SAFE_MTU=1320
-SING_DEFAULT_PORT=443
-
+WG_SAFE_MTU=1320
+WST_DEFAULT_PORT=443
+WG_SERVER_PORT_DEFAULT=51820
+WST_LOCAL_UDP_PORT_DEFAULT=51820
 ROUTE_TABLE_ID=51820
-
-SNI_LIST_FILE="${SING_DIR}/sni_list.txt"
-SNI_ROTATE_TIMER="/etc/systemd/system/sni-rotate.timer"
-SNI_ROTATE_SERVICE="/etc/systemd/system/sni-rotate.service"
 
 if [[ $EUID -ne 0 ]]; then
   echo "❌ 权限不足：请以 root 身份运行此脚本。"
@@ -30,7 +33,11 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 get_role() {
-  [[ -f "$ROLE_FILE" ]] && cat "$ROLE_FILE" 2>/dev/null || echo "unknown"
+  if [[ -f "$ROLE_FILE" ]]; then
+    cat "$ROLE_FILE" 2>/dev/null || echo "unknown"
+  else
+    echo "unknown"
+  fi
 }
 
 set_role() {
@@ -40,12 +47,12 @@ set_role() {
 }
 
 rand_str() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 24
 }
 
 detect_public_ip() {
   local ip=""
-  for svc in "https://api.ipify.org" "https://ifconfig.me"; do
+  for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
     ip=$(curl -4 -fsS --max-time 3 "$svc" 2>/dev/null || true)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$ip"
@@ -55,13 +62,24 @@ detect_public_ip() {
   return 1
 }
 
+resolve_ipv4() {
+  local host="$1"
+  getent ahostsv4 "$host" 2>/dev/null | awk 'NR==1{print $1}'
+}
+
 ensure_dirs() {
-  mkdir -p "$SING_DIR"
-  chmod 700 "$SING_DIR"
+  mkdir -p "$WG_DIR" "$WST_DIR"
+  chmod 700 "$WG_DIR" "$WST_DIR" 2>/dev/null || true
 }
 
 get_wan_if() {
-  ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") print $(i+1)}' | head -n1 || echo "eth0"
+  local wan
+  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 | grep -v '^$')
+  echo "${wan:-eth0}"
+}
+
+get_main_gateway() {
+  ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++){if($i=="via"){print $(i+1); exit}}}'
 }
 
 enable_ip_forward_global() {
@@ -71,131 +89,90 @@ enable_ip_forward_global() {
   sysctl -p >/dev/null 2>&1 || true
 }
 
-install_base_packages() {
-  echo "[*] 安装基础依赖..."
-  apt-get update -yq
-  apt-get install -yq curl wget tar jq nginx certbot python3-certbot-nginx
+save_wst_params() {
+  local host="$1" port="$2" path="$3" verify="$4"
+  echo "$host" > "$WST_REMOTE_HOST_FILE"
+  echo "$port" > "$WST_REMOTE_PORT_FILE"
+  echo "$path" > "$WST_PATH_FILE"
+  echo "$verify" > "$WST_VERIFY_FILE"
 }
 
 ensure_server_bypass_route() {
-  echo "[*] 确保本地系统路由分流策略生效..."
-  enable_ip_forward_global
-}
-
-init_sni_list() {
-  mkdir -p "$SING_DIR"
-  if [[ ! -f "$SNI_LIST_FILE" ]]; then
-    cat > "$SNI_LIST_FILE" <<EOF
-itunes.apple.com
-www.apple.com
-update.apple.com
-gateway.icloud.com
-www.samsung.com
-www.google.com
-EOF
-  fi
-}
-
-get_random_sni() {
-  init_sni_list
-  shuf -n 1 "$SNI_LIST_FILE"
-}
-
-rotate_client_sni() {
-  [[ "$(get_role)" != "entry" ]] && { echo "❌ 此功能仅限入口服务器可用"; return; }
-  echo "==== 手动切换客户端 SNI ===="
-  local new_sni
-  new_sni=$(get_random_sni)
-  echo "[*] 正在切换至: $new_sni"
-  
-  if [[ -f "${SING_DIR}/config.json" ]]; then
-    /usr/bin/jq --arg sni "$new_sni" '.outbounds[0].tls.server_name = $sni' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
-    mv "${SING_DIR}/config.json.tmp" "${SING_DIR}/config.json"
-    systemctl restart singbox-entry.service
-    echo "✅ SNI 切换成功！当前已生效: $new_sni"
-  else
-    echo "❌ 找不到配置文件！"
-  fi
-}
-
-setup_sni_rotation() {
-  echo "[*] 配置自动定时轮换机制 (Systemd Timer)..."
-  
-  cat > "${SING_DIR}/rotate.sh" <<'EOF'
-#!/usr/bin/env bash
-set -euo pipefail
-new_sni=$(shuf -n 1 /etc/singbox/sni_list.txt)
-/usr/bin/jq --arg sni "$new_sni" '.outbounds[0].tls.server_name = $sni' /etc/singbox/config.json > /etc/singbox/config.json.tmp
-mv /etc/singbox/config.json.tmp /etc/singbox/config.json
-systemctl restart singbox-entry.service
-EOF
-  
-  chmod +x "${SING_DIR}/rotate.sh"
-
-  cat > "$SNI_ROTATE_SERVICE" <<EOF
-[Unit]
-Description=Rotate Sing-box Reality SNI
-
-[Service]
-Type=oneshot
-ExecStart=/etc/singbox/rotate.sh
-EOF
-
-  cat > "$SNI_ROTATE_TIMER" <<EOF
-[Unit]
-Description=Timer for SNI Rotation
-
-[Timer]
-OnUnitActiveSec=6h
-RandomizedDelaySec=1800
-Unit=sni-rotate.service
-
-[Install]
-WantedBy=timers.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable --now sni-rotate.timer
-  echo "✅ SNI 定时轮换开启（每 6 小时触发一次，外加 30 分钟随机时间扰动）"
-}
-
-install_singbox() {
-  echo "[*] 检查 sing-box Reality 核心..."
-  if [[ -x "$SING_BIN" ]]; then
-    echo "[*] sing-box 已就绪"
+  local remote_host remote_ip wan_if gateway
+  [[ -f "$WST_REMOTE_HOST_FILE" ]] || return 0
+  remote_host="$(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
+  [[ -n "$remote_host" ]] || return 0
+  remote_ip="$(resolve_ipv4 "$remote_host")"
+  [[ -n "$remote_ip" ]] || remote_ip="$remote_host"
+  wan_if="$(get_wan_if)"
+  gateway="$(get_main_gateway)"
+  if [[ -z "$gateway" ]]; then
     return 0
   fi
+  ip route replace "${remote_ip}/32" via "$gateway" dev "$wan_if" 2>/dev/null || true
+}
 
-  local arch file url_base url_bin url_sum tmpdir
+install_base_packages() {
+  local need_pkgs=(curl tar ca-certificates iproute2 iptables nginx openssl lsb-release certbot python3-certbot-nginx)
+  local missing=()
+  for pkg in "${need_pkgs[@]}"; do
+    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  apt install -y "${missing[@]}"
+}
+
+install_wireguard() {
+  local need_pkgs=(wireguard wireguard-tools)
+  local missing=()
+  for pkg in "${need_pkgs[@]}"; do
+    dpkg -s "$pkg" &>/dev/null || missing+=("$pkg")
+  done
+  if [[ ${#missing[@]} -eq 0 ]]; then
+    return 0
+  fi
+  export DEBIAN_FRONTEND=noninteractive
+  apt update
+  apt install -y "${missing[@]}"
+}
+
+install_wstunnel() {
+  if [[ -x "$WSTUNNEL_BIN" ]]; then
+    local cur_ver
+    cur_ver=$("$WSTUNNEL_BIN" --version 2>/dev/null || true)
+    if [[ -n "$cur_ver" ]]; then
+      return 0
+    fi
+  fi
+  mkdir -p "$WST_DIR"
+  local arch file url_base url_bin url_sum tmpdir bin_name
   arch="$(uname -m)"
   case "$arch" in
-    x86_64|amd64) file="sing-box-${SING_VERSION}-linux-amd64.tar.gz" ;;
-    aarch64|arm64) file="sing-box-${SING_VERSION}-linux-arm64.tar.gz" ;;
-    *) echo "❌ 不支持的架构: $arch"; exit 1 ;;
+    x86_64|amd64) file="wstunnel_${WSTUNNEL_VERSION}_linux_amd64.tar.gz" ;;
+    aarch64|arm64) file="wstunnel_${WSTUNNEL_VERSION}_linux_arm64.tar.gz" ;;
+    armv7l|armv6l) file="wstunnel_${WSTUNNEL_VERSION}_linux_armv6.tar.gz" ;;
+    *) exit 1 ;;
   esac
-
-  url_base="https://github.com/SagerNet/sing-box/releases/download/v${SING_VERSION}"
+  url_base="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}"
   url_bin="${url_base}/${file}"
-  url_sum="${url_base}/sing-box-${SING_VERSION}-linux-amd64.tar.gz.sha256sum"
-
+  url_sum="${url_base}/wstunnel_${WSTUNNEL_VERSION}_checksums.txt"
   tmpdir="$(mktemp -d)"
   (
     cd "$tmpdir"
-    echo "[*] 下载 sing-box ${SING_VERSION}..."
+    curl -sL --fail "$url_sum" -o checksums.txt
     curl -L --fail "$url_bin" -o "$file"
-    curl -L --fail "$url_sum" -o checksums.txt
-
-    echo "[*] 执行 SHA256 校验..."
     if ! grep "$file" checksums.txt | sha256sum -c -; then
-      echo "❌ 致命错误：sing-box 二进制哈希校验失败！"
-      exit 1
+       exit 1
     fi
-
     tar -xzf "$file"
-    install -m 0755 sing-box "$SING_BIN"
+    bin_name="$(find . -maxdepth 1 -type f \( -name "wstunnel" -o -name "wstunnel-cli" \) | head -n1)"
+    install -m 0755 "$bin_name" "$WSTUNNEL_BIN"
   )
   rm -rf "$tmpdir"
-  echo "✅ sing-box Reality 已安全安装"
 }
 
 write_nginx_http_site_for_acme() {
@@ -203,7 +180,6 @@ write_nginx_http_site_for_acme() {
   local site_file="${NGINX_SITE_DIR}/${domain}.conf"
   local web_root="${WEB_ROOT_BASE}/${domain}"
   mkdir -p "$web_root"
-
   cat > "$site_file" <<EOF
 server {
     listen 80;
@@ -213,11 +189,15 @@ server {
         default_type "text/plain";
         try_files \$uri =404;
     }
-    location / { return 301 https://\$host\$request_uri; }
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
 }
 EOF
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
-  nginx -t && systemctl restart nginx
+  nginx -t
+  systemctl restart nginx
+  echo "$site_file" > "$WST_NGINX_SITE_FILE"
 }
 
 issue_letsencrypt_cert() {
@@ -225,248 +205,362 @@ issue_letsencrypt_cert() {
   certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect
 }
 
-write_nginx_https_reality_site() {
-  local domain="$1" short_id="$2"
+write_nginx_https_wstunnel_site() {
+  local domain="$1" backend_port="$2" path_prefix="$3"
   local site_file="${NGINX_SITE_DIR}/${domain}.conf"
   local web_root="${WEB_ROOT_BASE}/${domain}"
-
   mkdir -p "$web_root"
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="zh-CN">
-<head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>系统架构与研发笔记</title>
-<style>body{font-family:system-ui;margin:40px auto;max-width:860px;line-height:1.6;color:#333;}</style>
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>日常随笔</title>
+    <style>body{font-family: 'PingFang SC', 'Microsoft YaHei', sans-serif; margin:40px auto; max-width:700px; line-height:1.8; color:#444; padding:0 20px;} h1{color:#222; font-weight:normal;} .date{color:#999; font-size:0.9em; margin-bottom:30px;} p{margin-bottom:20px;} hr{border:0; border-top:1px solid #eee; margin:50px 0;} footer{color:#aaa; font-size:0.8em; text-align:center;}</style>
 </head>
 <body>
-<h1>后端架构与协议解析</h1>
-<p>记录微服务、容器化、网络协议（TCP/IP、Reality、Vision）实战经验。</p>
-<p>更新时间：2026年4月</p>
-<hr>
-<p>© 2026 All Rights Reserved. 内部技术文档。</p>
+    <h1>春日漫无目的散步</h1>
+    <p class="date">2026年4月</p>
+    <p>周末难得是个大晴天，没有定闹钟，睡到自然醒。下楼顺着街边一直往前走，没开导航，就是想随便看看平时匆匆路过的风景。</p>
+    <p>在转角的一家老旧咖啡馆坐了一个下午，看书，发呆，听隔壁桌聊着琐碎的生活日常。阳光打在木桌上，光影拉得很长。生活其实不需要那么多宏大的叙事，这种可以自由支配时间的缝隙，本身就是一种治愈。</p>
+    <p>提醒自己：下周三记得把阳台的几盆植物换土。</p>
+    <hr>
+    <footer>© 2026 个人碎碎念. 安静生活.</footer>
 </body>
 </html>
 EOF
-
   echo "User-agent: *" > "$web_root/robots.txt"
-  echo "Disallow: /${short_id}" >> "$web_root/robots.txt"
-
+  echo "Disallow: /admin/" >> "$web_root/robots.txt"
+  echo "Disallow: /${path_prefix}" >> "$web_root/robots.txt"
   cat > "$site_file" <<EOF
 server {
     listen 80;
     server_name ${domain};
-    location ^~ /.well-known/acme-challenge/ { root ${web_root}; }
+    location ^~ /.well-known/acme-challenge/ {
+        root ${web_root};
+        default_type "text/plain";
+    }
     location / { return 301 https://\$host\$request_uri; }
 }
-
 server {
-    listen 127.0.0.1:8443 ssl http2;
+    listen 443 ssl http2;
     server_name ${domain};
-
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
-
+    ssl_session_timeout 1d;
+    ssl_session_cache shared:SSL:10m;
     ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers HIGH:!aNULL:!MD5;
     ssl_prefer_server_ciphers on;
     ssl_stapling on;
     ssl_stapling_verify on;
-
     add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     add_header X-Content-Type-Options nosniff;
     add_header X-Frame-Options DENY;
-
     root ${web_root};
     index index.html;
-
     location / {
+        limit_req zone=req_limit burst=20 nodelay;
         try_files \$uri \$uri/ /index.html;
     }
-
-    location ^~ /${short_id} {
-        return 444; 
+    location ^~ /${path_prefix} {
+        proxy_pass http://127.0.0.1:${backend_port};
+        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_read_timeout 3600;
+        proxy_send_timeout 3600;
+        proxy_buffering off;
+        proxy_hide_header X-Powered-By;
+        proxy_hide_header Server;
     }
 }
+limit_req_zone \$binary_remote_addr zone=req_limit:10m rate=10r/s;
 EOF
-
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
   nginx -t && systemctl restart nginx
-  echo "✅ 高保真静态伪装站已部署（Reality 隐藏在 443）"
+  echo "$site_file" > "$WST_NGINX_SITE_FILE"
 }
 
-build_singbox_routes() {
-  [[ ! -f "${SING_DIR}/config.json" ]] && return 0
-  
-  local mode="$(cat "$MODE_FILE" 2>/dev/null || echo "split")"
-  local ports_json="[]"
-  
-  if [[ -f "$PORT_LIST_FILE" ]]; then
-    ports_json=$(awk 'NF && !/^#/{print int($1)}' "$PORT_LIST_FILE" | /usr/bin/jq -R . | /usr/bin/jq -s 'map(tonumber)')
-    [[ -z "$ports_json" ]] && ports_json="[]"
-  fi
-
-  if [[ "$mode" == "global" ]]; then
-    /usr/bin/jq '.route.rules = [
-      {"port": [22], "outbound": "direct"},
-      {"inbound": ["tun-in"], "outbound": "reality-out"}
-    ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
-  else
-    if [[ "$ports_json" == "[]" ]]; then
-      /usr/bin/jq '.route.rules = [
-        {"port": [22], "outbound": "direct"},
-        {"outbound": "direct"}
-      ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
-    else
-      /usr/bin/jq --argjson p "$ports_json" '.route.rules = [
-        {"port": [22], "outbound": "direct"},
-        {"inbound": ["tun-in"], "port": $p, "outbound": "reality-out"},
-        {"outbound": "direct"}
-      ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
-    fi
-  fi
-  
-  mv "${SING_DIR}/config.json.tmp" "${SING_DIR}/config.json"
-}
-
-setup_exit_reality() {
-  local domain="$1" short_id="$2" uuid="$3" private_key="$4"
-
-  cat > "${SING_DIR}/config.json" <<EOF
-{
-  "log": {"level": "info"},
-  "inbounds": [{
-    "type": "vless",
-    "tag": "reality-in",
-    "listen": "::",
-    "listen_port": 443,
-    "users": [{"uuid": "${uuid}", "flow": "xtls-rprx-vision"}],
-    "tls": {
-      "enabled": true,
-      "server_name": "${domain}",
-      "reality": {
-        "enabled": true,
-        "handshake": {
-          "server_opts": {
-            "server_names": ["${domain}"]
-          }
-        },
-        "private_key": "${private_key}",
-        "short_id": ["${short_id}"],
-        "dest": "127.0.0.1:8443"
-      }
-    }
-  }],
-  "outbounds": [{"type": "direct", "tag": "direct"}],
-  "route": {"rules": [{"inbound": "reality-in", "outbound": "direct"}]}
-}
-EOF
-
-  cat > /etc/systemd/system/singbox-exit.service <<EOF
+setup_exit_wstunnel_service() {
+  local backend_port="$1" path_prefix="$2" wg_udp_port="$3"
+  echo "$wg_udp_port" > "$WST_WG_UDP_PORT_FILE"
+  cat >/etc/systemd/system/wstunnel-exit.service <<EOF
 [Unit]
-Description=sing-box Reality Exit (VLESS + Reality + Vision)
-After=network-online.target
+Description=wstunnel server
+After=network-online.target wg-quick@${WG_IF}.service nginx.service
+Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=${SING_BIN} run -c ${SING_DIR}/config.json
+ExecStart=${WSTUNNEL_BIN} server --restrict-to 127.0.0.1:${wg_udp_port} --restrict-http-upgrade-path-prefix ${path_prefix} ws://127.0.0.1:${backend_port}
 Restart=on-failure
-RestartSec=3
+RestartSec=2
+User=root
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
-  systemctl enable --now singbox-exit.service
-  echo "✅ 出口 Reality 服务端已启动（端口 443）"
+  systemctl enable wstunnel-exit.service >/dev/null 2>&1 || true
+  systemctl restart wstunnel-exit.service || true
 }
 
-setup_entry_reality() {
-  local remote_host="$1" short_id="$2" public_key="$3" uuid="$4" chosen_sni="$5"
-
-  cat > "${SING_DIR}/config.json" <<EOF
-{
-  "log": {"level": "info"},
-  "inbounds": [{
-    "type": "tun",
-    "tag": "tun-in",
-    "interface_name": "${SING_IF}",
-    "inet4_address": "172.19.0.1/30",
-    "auto_route": true,
-    "strict_route": true,
-    "sniff": true,
-    "stack": "system"
-  }],
-  "outbounds": [
-    {
-      "type": "vless",
-      "tag": "reality-out",
-      "server": "${remote_host}",
-      "server_port": 443,
-      "uuid": "${uuid}",
-      "flow": "xtls-rprx-vision",
-      "packet_encoding": "xudp",
-      "tls": {
-        "enabled": true,
-        "server_name": "${chosen_sni}",
-        "utls": {"enabled": true, "fingerprint": "chrome"},
-        "reality": {
-          "enabled": true,
-          "public_key": "${public_key}",
-          "short_id": "${short_id}"
-        }
-      }
-    },
-    {
-      "type": "direct",
-      "tag": "direct"
-    }
-  ],
-  "route": {
-    "auto_detect_interface": true,
-    "rules": []
-  }
-}
-EOF
-
-  cat > /etc/systemd/system/singbox-entry.service <<EOF
+setup_entry_wstunnel_service() {
+  local remote_host="$1" remote_port="$2" path_prefix="$3" verify_tls="$4" local_udp_port="$5" remote_wg_udp_port="$6"
+  echo "$local_udp_port" > "$WST_LOCAL_UDP_PORT_FILE"
+  local verify_flag=""
+  if [[ "$verify_tls" == "y" || "$verify_tls" == "Y" ]]; then
+    verify_flag="--tls-verify-certificate"
+  fi
+  cat >/etc/systemd/system/wstunnel-entry.service <<EOF
 [Unit]
-Description=sing-box Reality Entry Client (TUN + VLESS-Reality-Vision)
+Description=wstunnel client
 After=network-online.target
+Wants=network-online.target
 [Service]
 Type=simple
-ExecStart=${SING_BIN} run -c ${SING_DIR}/config.json
+ExecStart=${WSTUNNEL_BIN} client -L udp://${local_udp_port}:127.0.0.1:${remote_wg_udp_port}?timeout_sec=0 --http-upgrade-path-prefix ${path_prefix} --http-host-header "${remote_host}" --websocket-ping-frequency-sec 25 ${verify_flag} wss://${remote_host}:${remote_port}
 Restart=on-failure
-RestartSec=3
+RestartSec=2
+User=root
 LimitNOFILE=1048576
 [Install]
 WantedBy=multi-user.target
 EOF
-
   systemctl daemon-reload
-  systemctl enable --now singbox-entry.service
-  echo "✅ 入口 Reality 客户端已启动（TUN 全局/分流模式）"
+  systemctl enable wstunnel-entry.service >/dev/null 2>&1 || true
+  systemctl restart wstunnel-entry.service || true
+}
+
+configure_exit_wg() {
+  local wg_addr="$1" entry_wg_ip="$2" entry_public_key="$3" out_if="$4" wg_udp_port="$5"
+  cd "$WG_DIR"
+  if [[ ! -f exit_private.key ]]; then
+    umask 077
+    wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+  fi
+  local exit_private_key exit_public_key
+  exit_private_key="$(cat exit_private.key)"
+  exit_public_key="$(cat exit_public.key)"
+  echo
+  echo "====== 出口服务器 公钥（发给入口服务器用）======"
+  echo "${exit_public_key}"
+  echo "================================================"
+  echo
+  cat > "${WG_DIR}/${WG_IF}.conf" <<EOF
+[Interface]
+Address = ${wg_addr}
+ListenPort = ${wg_udp_port}
+PrivateKey = ${exit_private_key}
+MTU = ${WG_SAFE_MTU}
+PostUp   = iptables -A FORWARD -i ${WG_IF} -o ${out_if} -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT; iptables -A FORWARD -i ${out_if} -o ${WG_IF} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT; iptables -t nat -A POSTROUTING -s ${entry_wg_ip%/*}/24 -o ${out_if} -j MASQUERADE; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = iptables -D FORWARD -i ${WG_IF} -o ${out_if} -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true; iptables -D FORWARD -i ${out_if} -o ${WG_IF} -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true; iptables -t nat -D POSTROUTING -s ${entry_wg_ip%/*}/24 -o ${out_if} -j MASQUERADE 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+[Peer]
+PublicKey = ${entry_public_key}
+AllowedIPs = ${entry_wg_ip}
+EOF
+  chmod 600 "${WG_DIR}/${WG_IF}.conf"
+  enable_ip_forward_global
+  systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+  wg-quick up "${WG_IF}"
+}
+
+configure_entry_wg() {
+  local wg_addr="$1" exit_wg_ip="$2" exit_public_key="$3" local_udp_port="$4"
+  cd "$WG_DIR"
+  if [[ ! -f entry_private.key ]]; then
+    umask 077
+    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
+  fi
+  local entry_private_key entry_public_key
+  entry_private_key="$(cat entry_private.key)"
+  entry_public_key="$(cat entry_public.key)"
+  echo
+  echo "====== 入口服务器 公钥（出口服务器用）======"
+  echo "${entry_public_key}"
+  echo "================================================"
+  echo
+  cat > "${WG_DIR}/${WG_IF}.conf" <<EOF
+[Interface]
+Address = ${wg_addr}
+PrivateKey = ${entry_private_key}
+Table = off
+MTU = ${WG_SAFE_MTU}
+PostUp   = ip rule show | grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}" || ip rule add fwmark 0x1 lookup ${ROUTE_TABLE_ID}; ip route replace default dev ${WG_IF} table ${ROUTE_TABLE_ID}; iptables -t nat -C POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o ${WG_IF} -j MASQUERADE; iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+PostDown = ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true; ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true; iptables -t nat -D POSTROUTING -o ${WG_IF} -j MASQUERADE 2>/dev/null || true; iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+[Peer]
+PublicKey = ${exit_public_key}
+Endpoint = 127.0.0.1:${local_udp_port}
+AllowedIPs = 0.0.0.0/0
+PersistentKeepalive = 20
+EOF
+  chmod 600 "${WG_DIR}/${WG_IF}.conf"
+  local exit_wg_ip_no_mask="${exit_wg_ip%%/*}"
+  echo "$exit_wg_ip_no_mask" > "$EXIT_WG_IP_FILE"
+  systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+  wg-quick up "${WG_IF}"
+}
+
+clear_mark_rules() {
+  for chain in OUTPUT PREROUTING; do
+    iptables -t mangle -S "$chain" 2>/dev/null | grep " MARK " | sed 's/^-A /-D /' | while read -r line; do
+      iptables -t mangle $line 2>/dev/null || true
+    done
+  done
 }
 
 get_current_mode() {
-  [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" 2>/dev/null || echo "split"
+  if [[ -f "$MODE_FILE" ]]; then cat "$MODE_FILE" 2>/dev/null || echo "split"; else echo "split"; fi
 }
 
 set_mode_flag() { echo "$1" > "$MODE_FILE"; }
 
+ensure_policy_routing_for_ports() {
+  if ! ip link show "${WG_IF}" &>/dev/null; then return 0; fi
+  if ! ip rule show | grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}"; then ip rule add fwmark 0x1 lookup ${ROUTE_TABLE_ID}; fi
+  ip route replace default dev "${WG_IF}" table ${ROUTE_TABLE_ID}
+  ensure_server_bypass_route
+}
+
+apply_port_rules_from_file() {
+  clear_mark_rules
+  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
+  while read -r p; do
+    [[ -z "$p" ]] && continue
+    iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1
+    iptables -t mangle -C PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1
+  done < "$PORT_LIST_FILE"
+  local wst_port=""
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && wst_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  if [[ -n "$wst_port" ]]; then
+    iptables -t mangle -C OUTPUT -p tcp --dport "$wst_port" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport "$wst_port" -j RETURN
+    iptables -t mangle -C OUTPUT -p udp --dport "$wst_port" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "$wst_port" -j RETURN
+  fi
+}
+
+add_port_to_list() {
+  local port="$1"
+  mkdir -p "$(dirname "$PORT_LIST_FILE")"
+  touch "$PORT_LIST_FILE"
+  if grep -qx "$port" "$PORT_LIST_FILE"; then
+    return 0
+  fi
+  echo "$port" >> "$PORT_LIST_FILE"
+}
+
+remove_port_from_list() {
+  local port="$1"
+  [[ ! -f "$PORT_LIST_FILE" ]] && return 0
+  if ! grep -qx "$port" "$PORT_LIST_FILE"; then
+    return 0
+  fi
+  sed -i "\|^$port$|d" "$PORT_LIST_FILE"
+}
+
+remove_port_iptables_rules() {
+  local port="$1"
+  iptables -t mangle -D OUTPUT -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -p tcp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+  iptables -t mangle -D PREROUTING -p udp --dport "$port" -j MARK --set-mark 0x1 2>/dev/null || true
+}
+
+add_forward_port_mapping() {
+  local port="$1" exit_ip wan_if
+  [[ -z "$port" ]] && return 0
+  [[ -f "$EXIT_WG_IP_FILE" ]] || return 0
+  exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
+  [[ -n "$exit_ip" ]] || return 0
+  enable_ip_forward_global
+  wan_if="$(get_wan_if)"
+  ip route replace "${exit_ip}/32" dev "${WG_IF}" 2>/dev/null || true
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+  iptables -t nat -C PREROUTING -i "${wan_if}" -p udp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || iptables -t nat -A PREROUTING -i "${wan_if}" -p udp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}"
+  iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -p udp --dport "${port}" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -p udp --dport "${port}" -j ACCEPT
+  iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -p udp --sport "${port}" -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -p udp --sport "${port}" -j ACCEPT
+  iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+}
+
+remove_forward_port_mapping() {
+  local port="$1" exit_ip wan_if
+  [[ -z "$port" ]] && return 0
+  [[ -f "$EXIT_WG_IP_FILE" ]] || return 0
+  exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
+  [[ -n "$exit_ip" ]] || return 0
+  wan_if="$(get_wan_if)"
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p tcp --dport "${port}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p tcp --sport "${port}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i "${wan_if}" -p udp --dport "${port}" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+  iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -p udp --dport "${port}" -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p udp --sport "${port}" -j ACCEPT 2>/dev/null || true
+}
+
 enable_global_mode() {
-  echo "[*] 切换为【全局模式】..."
+  ensure_policy_routing_for_ports
+  clear_mark_rules
+  local remote_port="" wan_if exit_ip=""
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && remote_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  wan_if="$(get_wan_if)"
+  [[ -f "$EXIT_WG_IP_FILE" ]] && exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
+  enable_ip_forward_global
+  ensure_server_bypass_route
+  if [[ -n "$exit_ip" ]]; then
+    ip route replace "${exit_ip}/32" dev "${WG_IF}" 2>/dev/null || true
+    iptables -t nat -C PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || iptables -t nat -A PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
+    iptables -t nat -C PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || iptables -t nat -A PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}"
+    iptables -C FORWARD -i "${wan_if}" -o "${WG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${wan_if}" -o "${WG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
+    iptables -C FORWARD -i "${WG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "${WG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    iptables -t nat -C POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "${WG_IF}" -j MASQUERADE
+  fi
+  iptables -t mangle -C OUTPUT -o lo -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -o lo -j RETURN
+  iptables -t mangle -C OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --sport 22 -j RETURN
+  iptables -t mangle -C OUTPUT -p tcp --dport 22 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 22 -j RETURN
+  iptables -t mangle -C OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport 53 -j RETURN
+  iptables -t mangle -C OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport 53 -j RETURN
+  if [[ -n "$remote_port" ]]; then
+    iptables -t mangle -C OUTPUT -p tcp --dport "${remote_port}" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport "${remote_port}" -j RETURN
+    iptables -t mangle -C OUTPUT -p udp --dport "${remote_port}" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "${remote_port}" -j RETURN
+  fi
+  iptables -t mangle -C OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1
+  iptables -t mangle -C PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1
+  ip link set dev "${WG_IF}" mtu "${WG_SAFE_MTU}" 2>/dev/null || true
   set_mode_flag "global"
-  build_singbox_routes
-  systemctl restart singbox-entry.service 2>/dev/null || true
-  echo "✅ 已切换全局模式（sing-box TUN）"
 }
 
 enable_split_mode() {
-  echo "[*] 切换为【端口分流模式】..."
+  local exit_ip wan_if
+  [[ -f "$EXIT_WG_IP_FILE" ]] && exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
+  wan_if="$(get_wan_if)"
+  if [[ -n "${exit_ip:-}" ]]; then
+    iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+    iptables -t nat -D PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
+    iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+    iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  fi
+  ensure_policy_routing_for_ports
+  clear_mark_rules
+  apply_port_rules_from_file
+  if [[ -f "$PORT_LIST_FILE" ]]; then
+    while read -r p; do
+      [[ -z "$p" ]] && continue
+      add_forward_port_mapping "$p"
+    done < "$PORT_LIST_FILE"
+  fi
+  ip link set dev "${WG_IF}" mtu "${WG_SAFE_MTU}" 2>/dev/null || true
   set_mode_flag "split"
-  build_singbox_routes
-  systemctl restart singbox-entry.service 2>/dev/null || true
-  echo "✅ 已切换端口分流模式（sing-box TUN）"
 }
 
 apply_current_mode() {
@@ -479,149 +573,119 @@ apply_current_mode() {
   fi
 }
 
-choose_sni() {
-  init_sni_list
-  echo "==== 请选择初始 SNI ====" >&2
-  echo "1) itunes.apple.com (默认)" >&2
-  echo "2) www.apple.com" >&2
-  echo "3) update.apple.com" >&2
-  echo "4) gateway.icloud.com" >&2
-  echo "5) www.samsung.com" >&2
-  echo "6) www.google.com" >&2
-  read -rp "输入序号 [1-6]: " sni_idx >&2
-  case "$sni_idx" in
-    2) echo "www.apple.com" ;;
-    3) echo "update.apple.com" ;;
-    4) echo "gateway.icloud.com" ;;
-    5) echo "www.samsung.com" ;;
-    6) echo "www.google.com" ;;
-    *) echo "itunes.apple.com" ;;
-  esac
-}
-
 configure_exit() {
-  echo "==== 配置为【出口服务器】（Reality） ===="
   set_role "exit"
-
   ensure_dirs
   install_base_packages
-  install_singbox
-
-  local domain short_id uuid private_key pub_ip
-
-  pub_ip="$(detect_public_ip || true)"
-  [[ -n "$pub_ip" ]] && echo "[*] 检测到公网 IP：$pub_ip"
-
-  read -rp "出口服务器绑定域名（必须解析到本机）: " domain
-  [[ -z "$domain" ]] && { echo "❌ 域名不能为空"; return; }
-
-  short_id="$(rand_str)"
-  uuid="$(cat /proc/sys/kernel/random/uuid)"
-  
-  local keypair
-  keypair=$(${SING_BIN} generate reality-keypair)
-  private_key=$(echo "$keypair" | awk '/PrivateKey/ {print $2}')
-  public_key=$(echo "$keypair" | awk '/PublicKey/ {print $2}')
-
-  echo "$domain" > "${SING_DIR}/domain"
-  echo "$short_id" > "${SING_DIR}/short_id"
-  echo "$uuid" > "${SING_DIR}/uuid"
-  echo "$public_key" > "${SING_DIR}/public_key"
-
+  install_wireguard
+  install_wstunnel
+  local pub_ip_detected domain wg_addr entry_wg_ip out_if
+  local entry_public_key ws_port path_prefix default_if
+  local wg_udp_port backend_port
+  pub_ip_detected="$(detect_public_ip || true)"
+  read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
+  if [[ -z "$domain" ]]; then
+    return
+  fi
+  echo "$domain" > "$WST_DOMAIN_FILE"
+  read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " wg_addr
+  wg_addr="${wg_addr:-10.0.0.1/24}"
+  read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/32): " entry_wg_ip
+  entry_wg_ip="${entry_wg_ip:-10.0.0.2/32}"
+  default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1)
+  read -rp "出口服务器对外网卡名(默认 ${default_if:-eth0}): " out_if
+  out_if="${out_if:-${default_if:-eth0}}"
+  read -rp "Nginx/WSS 对外端口 (默认 443): " ws_port
+  ws_port="${ws_port:-443}"
+  read -rp "出口服务器 WG 真正监听 UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " wg_udp_port
+  wg_udp_port="${wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+  backend_port=$((RANDOM % 1000 + 30000))
+  local recommended_path="static/assets/img_$(rand_str | head -c 6)"
+  read -rp "WebSocket 路径前缀/密钥 (默认 ${recommended_path}): " path_prefix
+  path_prefix="${path_prefix:-${recommended_path}}"
   write_nginx_http_site_for_acme "$domain"
   issue_letsencrypt_cert "$domain"
-  write_nginx_https_reality_site "$domain" "$short_id"
-
-  setup_exit_reality "$domain" "$short_id" "$uuid" "$private_key"
-
-  echo
-  echo "====== 出口服务器信息（给入口用）======"
-  echo "域名: ${domain}"
-  echo "short_id: ${short_id}"
-  echo "public_key: ${public_key}"
-  echo "UUID: ${uuid}"
-  echo "======================================"
+  write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix"
+  read -rp "请输入【入口服务器公钥】: " entry_public_key
+  entry_public_key="${entry_public_key:-CHANGE_ME_ENTRY_PUBLIC_KEY}"
+  configure_exit_wg "$wg_addr" "$entry_wg_ip" "$entry_public_key" "$out_if" "$wg_udp_port"
+  setup_exit_wstunnel_service "$backend_port" "$path_prefix" "$wg_udp_port"
+  save_wst_params "$domain" "$ws_port" "$path_prefix" "y"
 }
 
 configure_entry() {
-  echo "==== 配置为【入口服务器】（Reality） ===="
   set_role "entry"
-
   ensure_dirs
   install_base_packages
-  install_singbox
-
-  local remote_host short_id public_key uuid chosen_sni enable_rotate
-
-  read -rp "出口服务器域名/IP: " remote_host
-  read -rp "short_id: " short_id
-  read -rp "public_key: " public_key
-  read -rp "UUID: " uuid
-
-  chosen_sni=$(choose_sni)
-
-  read -rp "是否开启 SNI 自动定时轮换？(Y/n): " enable_rotate
-  if [[ "${enable_rotate,,}" == "y" || -z "$enable_rotate" ]]; then
-    setup_sni_rotation
+  install_wireguard
+  install_wstunnel
+  local wg_addr exit_wg_ip exit_public_key
+  local exit_host ws_port path_prefix verify_tls
+  local local_udp_port remote_wg_udp_port
+  local saved_host saved_port saved_path saved_verify
+  read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/24): " wg_addr
+  wg_addr="${wg_addr:-10.0.0.2/24}"
+  read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/32): " exit_wg_ip
+  exit_wg_ip="${exit_wg_ip:-10.0.0.1/32}"
+  saved_host=""
+  saved_port=""
+  saved_path=""
+  saved_verify=""
+  [[ -f "$WST_REMOTE_HOST_FILE" ]] && saved_host="$(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
+  read -rp "出口服务器域名 / IP (默认 ${saved_host:-}): " exit_host
+  exit_host="${exit_host:-$saved_host}"
+  read -rp "wss 端口 (默认 ${saved_port:-443}): " ws_port
+  ws_port="${ws_port:-${saved_port:-443}}"
+  read -rp "路径前缀 (默认 ${saved_path:-自动生成}): " path_prefix
+  path_prefix="${path_prefix:-${saved_path:-$(rand_str)}}"
+  read -rp "是否严格校验证书? (Y/n，正式域名证书建议 Y): " verify_tls
+  verify_tls="${verify_tls:-Y}"
+  read -rp "入口本地 wstunnel 监听 UDP 端口 (默认 ${WST_LOCAL_UDP_PORT_DEFAULT}): " local_udp_port
+  local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
+  read -rp "远端出口 WG UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " remote_wg_udp_port
+  remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+  save_wst_params "$exit_host" "$ws_port" "$path_prefix" "$verify_tls"
+  setup_entry_wstunnel_service "$exit_host" "$ws_port" "$path_prefix" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
+  if [[ -f "${WG_DIR}/entry_public.key" ]]; then
+    cat "${WG_DIR}/entry_public.key" 2>/dev/null || true
   fi
-
-  echo "$remote_host" > "${SING_DIR}/remote_host"
-  echo "$short_id" > "${SING_DIR}/short_id"
-  echo "$public_key" > "${SING_DIR}/public_key"
-  echo "$uuid" > "${SING_DIR}/uuid"
-  echo "$chosen_sni" > "${SING_DIR}/chosen_sni"
-
-  setup_entry_reality "$remote_host" "$short_id" "$public_key" "$uuid" "$chosen_sni"
-
+  read -rp "请输入【出口服务器公钥】: " exit_public_key
+  exit_public_key="${exit_public_key:-CHANGE_ME_EXIT_PUBLIC_KEY}"
+  configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
   ensure_server_bypass_route
+  ensure_policy_routing_for_ports
   set_mode_flag "split"
-  build_singbox_routes
-  systemctl restart singbox-entry.service
+  apply_current_mode
 }
 
 manage_entry_ports() {
-  echo "端口分流管理"
+  ensure_policy_routing_for_ports
   while true; do
-    echo "1) 查看列表"
-    echo "2) 添加端口"
-    echo "3) 删除端口"
-    echo "0) 返回"
     read -rp "请选择: " sub
-
     case "$sub" in
       1)
         if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
           cat "$PORT_LIST_FILE"
-        else
-          echo "(空)"
         fi
         ;;
       2)
         read -rp "端口: " new_port
-        if [[ "$new_port" =~ ^[0-9]+$ ]] && [ "$new_port" -ge 1 ] && [ "$new_port" -le 65535 ] && [ "$new_port" -ne 22 ]; then
-          mkdir -p "$(dirname "$PORT_LIST_FILE")"
-          touch "$PORT_LIST_FILE"
-          if grep -qx "$new_port" "$PORT_LIST_FILE"; then
-            echo "端口 $new_port 已存在列表中。"
-          else
-            echo "$new_port" >> "$PORT_LIST_FILE"
-            echo "已添加端口 $new_port 到分流列表。"
-            build_singbox_routes
-            systemctl restart singbox-entry.service
-          fi
+        if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]] && [[ "$new_port" -ne 22 ]]; then
+          add_port_to_list "$new_port"
+          ensure_policy_routing_for_ports
+          apply_port_rules_from_file
+          add_forward_port_mapping "$new_port"
         fi
         ;;
       3)
         read -rp "要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
-          if [[ -f "$PORT_LIST_FILE" ]] && grep -qx "$del_port" "$PORT_LIST_FILE"; then
-            sed -i "\|^$del_port$|d" "$PORT_LIST_FILE"
-            echo "已从分流列表中删除端口 $del_port。"
-            build_singbox_routes
-            systemctl restart singbox-entry.service
-          else
-            echo "端口 $del_port 不在列表中。"
-          fi
+          remove_port_from_list "$del_port"
+          remove_port_iptables_rules "$del_port"
+          remove_forward_port_mapping "$del_port"
         fi
         ;;
       0) break ;;
@@ -631,86 +695,163 @@ manage_entry_ports() {
 
 manage_entry_mode() {
   while true; do
-    local mode="$(get_current_mode)"
-    echo "当前模式：$mode"
-    echo "1) 切换为【全局模式】"
-    echo "2) 切换为【端口分流模式】"
-    echo "0) 返回"
+    local mode
+    mode="$(get_current_mode)"
     read -rp "请选择: " sub
     case "$sub" in
       1) enable_global_mode ;;
       2) enable_split_mode ;;
       0) break ;;
-      *) echo "无效" ;;
     esac
   done
 }
 
 show_status() {
-  echo "==== Reality 链路状态 ===="
-  echo "角色：$(get_role)"
-  echo "模式：$(get_current_mode)"
-  echo
-  [[ -f "${SING_DIR}/remote_host" ]] && echo "出口地址：$(cat "${SING_DIR}/remote_host")"
-  echo
-  echo "==== sing-box ===="
-  systemctl --no-pager status singbox-exit.service 2>/dev/null | head -n 8 || true
-  systemctl --no-pager status singbox-entry.service 2>/dev/null | head -n 8 || true
-  echo
-  echo "==== Nginx ===="
-  systemctl --no-pager status nginx 2>/dev/null | head -n 6 || true
+  get_role
+  get_current_mode
+  if [[ -f "$WST_REMOTE_HOST_FILE" ]]; then cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true; fi
+  if [[ -f "$WST_REMOTE_PORT_FILE" ]]; then cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true; fi
+  if [[ -f "$WST_PATH_FILE" ]]; then cat "$WST_PATH_FILE" 2>/dev/null || true; fi
+  if [[ -f "$WST_DOMAIN_FILE" ]]; then cat "$WST_DOMAIN_FILE" 2>/dev/null || true; fi
+  wg show || true
+  systemctl --no-pager --full status wstunnel-exit.service 2>/dev/null | sed -n '1,6p' || true
+  systemctl --no-pager --full status wstunnel-entry.service 2>/dev/null | sed -n '1,6p' || true
+  systemctl --no-pager --full status nginx 2>/dev/null | sed -n '1,6p' || true
+  if [[ -f "$PORT_LIST_FILE" ]] && [[ -s "$PORT_LIST_FILE" ]]; then
+    cat "$PORT_LIST_FILE"
+  fi
 }
 
 start_wg() {
-  echo "[*] 启动 Reality 链路..."
-  local role="$(get_role)"
+  local role
+  role="$(get_role)"
   if [[ "$role" == "exit" ]]; then
-    systemctl restart singbox-exit.service nginx 2>/dev/null || true
+    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+    wg-quick up "${WG_IF}" 2>/dev/null || true
+    systemctl restart nginx 2>/dev/null || true
+    systemctl restart wstunnel-exit.service 2>/dev/null || true
   elif [[ "$role" == "entry" ]]; then
-    systemctl restart singbox-entry.service 2>/dev/null || true
+    systemctl restart wstunnel-entry.service 2>/dev/null || true
+    systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
+    wg-quick up "${WG_IF}" 2>/dev/null || true
+    ensure_server_bypass_route
     apply_current_mode
   fi
 }
 
 stop_wg() {
-  echo "[*] 停止 Reality 链路..."
-  systemctl stop singbox-exit.service singbox-entry.service 2>/dev/null || true
+  local role
+  role="$(get_role)"
+  if [[ "$role" == "exit" ]]; then
+    systemctl stop wstunnel-exit.service 2>/dev/null || true
+  elif [[ "$role" == "entry" ]]; then
+    systemctl stop wstunnel-entry.service 2>/dev/null || true
+  fi
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
+  clear_mark_rules
 }
 
-restart_wg() { stop_wg; start_wg; }
+restart_wg() {
+  stop_wg
+  start_wg
+}
 
-update_remote() {
-  [[ "$(get_role)" != "entry" ]] && { echo "❌ 仅入口可用"; return; }
-  echo "更新出口地址..."
-  read -rp "新出口域名/IP: " new_host
-  echo "$new_host" > "${SING_DIR}/remote_host"
-  build_singbox_routes
-  systemctl restart singbox-entry.service
-  echo "✅ 已更新"
+update_wstunnel_entry_remote_ip() {
+  [[ "$(get_role)" == "entry" ]] || return 1
+  ensure_dirs
+  local new_host new_port new_path verify_tls
+  local saved_port saved_path saved_verify local_udp_port remote_wg_udp_port
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && saved_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && local_udp_port="$(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_WG_UDP_PORT_FILE" ]] && remote_wg_udp_port="$(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
+  read -rp "新出口域名 / IP: " new_host
+  read -rp "wss 端口 (默认 ${saved_port:-443}): " new_port
+  new_port="${new_port:-${saved_port:-443}}"
+  read -rp "路径前缀 (默认 ${saved_path:-v1}): " new_path
+  new_path="${new_path:-${saved_path:-v1}}"
+  read -rp "是否严格校验证书? (默认 ${saved_verify:-Y}): " verify_tls
+  verify_tls="${verify_tls:-${saved_verify:-Y}}"
+  local_udp_port="${local_udp_port:-$WST_LOCAL_UDP_PORT_DEFAULT}"
+  remote_wg_udp_port="${remote_wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
+  save_wst_params "$new_host" "$new_port" "$new_path" "$verify_tls"
+  ensure_server_bypass_route
+  setup_entry_wstunnel_service "$new_host" "$new_port" "$new_path" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
 }
 
 renew_cert_now() {
-  [[ "$(get_role)" != "exit" ]] && { echo "❌ 仅出口可用"; return; }
+  if [[ "$(get_role)" != "exit" ]]; then
+    return
+  fi
+  install_certbot
   certbot renew --nginx
   nginx -t && systemctl reload nginx
 }
 
-uninstall() {
-  read -rp "确认彻底卸载 Reality？(y/N): " confirm
-  [[ ! "$confirm" =~ ^[yY]$ ]] && return
-  systemctl stop singbox-exit.service singbox-entry.service nginx 2>/dev/null || true
-  systemctl disable singbox-exit.service singbox-entry.service sni-rotate.timer 2>/dev/null || true
-  rm -f /etc/systemd/system/singbox-*.service /etc/systemd/system/sni-rotate.*
-  rm -rf "$SING_DIR" "$SING_BIN"
+uninstall_wg() {
+  read -rp "确认彻底卸载并清理？(y/N): " confirm
+  if [[ ! "$confirm" =~ ^[yY]$ ]]; then
+    return 0
+  fi
+  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  wg-quick down "${WG_IF}" 2>/dev/null || true
+  ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
+  clear_mark_rules
+  if [[ -f "$PORT_LIST_FILE" ]]; then
+    while read -r p; do
+      [[ -z "$p" ]] && continue
+      iptables -t mangle -D OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      iptables -t mangle -D PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || true
+      remove_forward_port_mapping "$p"
+    done < "$PORT_LIST_FILE"
+  fi
+  systemctl stop wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
+  systemctl disable wstunnel-exit.service wstunnel-entry.service 2>/dev/null || true
+  rm -f /etc/systemd/system/wstunnel-exit.service /etc/systemd/system/wstunnel-entry.service 2>/dev/null || true
+  systemctl daemon-reload || true
+  read -rp "是否连同Nginx伪装站点以及TLS证书一起彻底抹除？[y/N (默认N)]: " del_cert
+  del_cert="${del_cert:-N}"
+  if [[ "$del_cert" =~ ^[yY]$ ]]; then
+    apt purge -y nginx nginx-common nginx-core certbot python3-certbot-nginx 2>/dev/null || true
+    apt autoremove -y 2>/dev/null || true
+    if [[ -f "$WST_DOMAIN_FILE" ]]; then
+        local d
+        d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+        if [[ -n "$d" ]]; then
+           rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
+        fi
+    fi
+    rm -rf /etc/nginx 2>/dev/null || true
+    rm -rf /etc/letsencrypt /var/lib/letsencrypt 2>/dev/null || true
+    sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
+    sysctl -p >/dev/null 2>&1 || true
+  else
+    if [[ -f "$WST_NGINX_SITE_FILE" ]]; then
+      local site_file
+      site_file="$(cat "$WST_NGINX_SITE_FILE" 2>/dev/null || true)"
+      if [[ -n "$site_file" ]]; then
+        rm -f "$site_file" 2>/dev/null || true
+        rm -f "${NGINX_SITE_ENABLED_DIR}/$(basename "$site_file")" 2>/dev/null || true
+        nginx -t && systemctl reload nginx || true
+      fi
+    fi
+  fi
+  rm -rf "$WST_DIR" "$WG_DIR" 2>/dev/null || true
+  rm -f "$WSTUNNEL_BIN" 2>/dev/null || true
   apt remove -y wireguard wireguard-tools 2>/dev/null || true
-  echo "✅ Reality 已彻底清理"
-  rm -f "$0"
+  apt autoremove -y 2>/dev/null || true
+  rm -f "$0" 2>/dev/null || true
   exit 0
 }
 
 while true; do
   echo
-  echo "================ 📡 Reality VLESS + Vision + uTLS 高级链路 ================"
+  echo "================ 📡 WG + wstunnel v10 + Nginx 高级链路 ================"
   echo "1) 配置为 出口服务器"
   echo "2) 配置为 入口服务器"
   echo "3) 查看链路状态"
@@ -722,7 +863,6 @@ while true; do
   echo "9) 管理入口模式（全局 / 分流）"
   echo "10) 修改出口 IP / 域名"
   echo "11) 手动执行证书续期（仅出口）"
-  echo "12) 手动切换 SNI"
   echo "0) 退出"
   echo "====================================================================="
   read -rp "请选择: " choice
@@ -734,14 +874,12 @@ while true; do
     4) start_wg ;;
     5) stop_wg ;;
     6) restart_wg ;;
-    7) uninstall ;;
+    7) uninstall_wg ;;
     8) [[ "$(get_role)" == "entry" ]] && manage_entry_ports || echo "❌ 仅入口可用" ;;
     9) [[ "$(get_role)" == "entry" ]] && manage_entry_mode || echo "❌ 仅入口可用" ;;
-    10) [[ "$(get_role)" == "entry" ]] && update_remote || echo "❌ 仅入口可用" ;;
+    10) [[ "$(get_role)" == "entry" ]] && update_wstunnel_entry_remote_ip || echo "❌ 仅入口可用" ;;
     11) renew_cert_now ;;
-    12) rotate_client_sni ;;
     0) exit 0 ;;
-    *) echo "无效选项" ;;
+    *) echo "无效。" ;;
   esac
 done
-
