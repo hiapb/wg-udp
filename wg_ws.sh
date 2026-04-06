@@ -47,8 +47,9 @@ set_role() {
   echo "$role" > "$ROLE_FILE"
 }
 
+# 彻底修复严格模式闪退：读取内核自带的随机UUID作为字符串，绝对安全
 rand_str() {
-  tr -dc 'A-Za-z0-9' </dev/urandom 2>/dev/null | head -c 24 || true
+  cat /proc/sys/kernel/random/uuid | sed 's/-//g' | cut -c 1-24 || echo "a1b2c3d4e5f6g7h8"
 }
 
 detect_public_ip() {
@@ -73,9 +74,10 @@ ensure_dirs() {
   chmod 700 "$WG_DIR" "$WST_DIR" 2>/dev/null || true
 }
 
+# 优化获取网卡的方法，避免管道截断引发闪退
 get_wan_if() {
   local wan
-  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 | (grep -v '^$' || true))
+  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
   echo "${wan:-eth0}"
 }
 
@@ -360,19 +362,9 @@ EOF
 
 configure_exit_wg() {
   local wg_addr="$1" entry_wg_ip="$2" entry_public_key="$3" out_if="$4" wg_udp_port="$5"
-  cd "$WG_DIR"
-  if [[ ! -f exit_private.key ]]; then
-    umask 077
-    wg genkey | tee exit_private.key | wg pubkey > exit_public.key
-  fi
-  local exit_private_key exit_public_key
-  exit_private_key="$(cat exit_private.key)"
-  exit_public_key="$(cat exit_public.key)"
-  echo
-  echo "====== 出口服务器 公钥（发给入口服务器用）======"
-  echo "${exit_public_key}"
-  echo "================================================"
-  echo
+  local exit_private_key
+  exit_private_key="$(cat "${WG_DIR}/exit_private.key")"
+  
   cat > "${WG_DIR}/${WG_IF}.conf" <<EOF
 [Interface]
 Address = ${wg_addr}
@@ -394,19 +386,9 @@ EOF
 
 configure_entry_wg() {
   local wg_addr="$1" exit_wg_ip="$2" exit_public_key="$3" local_udp_port="$4"
-  cd "$WG_DIR"
-  if [[ ! -f entry_private.key ]]; then
-    umask 077
-    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
-  fi
-  local entry_private_key entry_public_key
-  entry_private_key="$(cat entry_private.key)"
-  entry_public_key="$(cat entry_public.key)"
-  echo
-  echo "====== 入口服务器 公钥（出口服务器用）======"
-  echo "${entry_public_key}"
-  echo "================================================"
-  echo
+  local entry_private_key
+  entry_private_key="$(cat "${WG_DIR}/entry_private.key")"
+  
   cat > "${WG_DIR}/${WG_IF}.conf" <<EOF
 [Interface]
 Address = ${wg_addr}
@@ -602,12 +584,27 @@ configure_exit() {
   install_base_packages
   install_wireguard
   install_wstunnel
+  
+  # 提前生成并展示本机的公钥（防止两边死锁）
+  cd "$WG_DIR"
+  if [[ ! -f exit_private.key ]]; then
+    umask 077
+    wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+  fi
+  local exit_public_key
+  exit_public_key="$(cat exit_public.key)"
+  echo ""
+  echo -e "\033[42;37m =============================================== \033[0m"
+  echo -e "\033[42;37m 🔑 【本机（出口服务器）公钥】请复制并保存好：   \033[0m"
+  echo -e "\033[32m${exit_public_key}\033[0m"
+  echo -e "\033[42;37m =============================================== \033[0m"
+  echo ""
+
   local pub_ip_detected wg_addr entry_wg_ip out_if
   local ws_port path_prefix default_if
   local wg_udp_port backend_port
   pub_ip_detected="$(detect_public_ip || true)"
   
-  # 强制必填：域名
   local domain=""
   while [[ -z "$domain" ]]; do
     read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
@@ -619,7 +616,7 @@ configure_exit() {
   wg_addr="${wg_addr:-10.0.0.1/24}"
   read -rp "入口服务器 WireGuard 内网 IP (默认 10.0.0.2/32): " entry_wg_ip
   entry_wg_ip="${entry_wg_ip:-10.0.0.2/32}"
-  default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if ($i=="dev") print $(i+1)}' | head -n1 || true)
+  default_if=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
   read -rp "出口服务器对外网卡名(默认 ${default_if:-eth0}): " out_if
   out_if="${out_if:-${default_if:-eth0}}"
   read -rp "Nginx/WSS 对外端口 (默认 443): " ws_port
@@ -627,7 +624,7 @@ configure_exit() {
   read -rp "出口服务器 WG 真正监听 UDP 端口 (默认 ${WG_SERVER_PORT_DEFAULT}): " wg_udp_port
   wg_udp_port="${wg_udp_port:-$WG_SERVER_PORT_DEFAULT}"
   backend_port=$((RANDOM % 1000 + 30000))
-  local recommended_path="static/assets/img_$(rand_str || echo "abc1234")"
+  local recommended_path="static/assets/img_$(rand_str)"
   read -rp "WebSocket 路径前缀/密钥 (默认 ${recommended_path}): " path_prefix
   path_prefix="${path_prefix:-${recommended_path}}"
   
@@ -635,10 +632,9 @@ configure_exit() {
   issue_letsencrypt_cert "$domain"
   write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix"
   
-  # 强制必填：入口服务器公钥
   local entry_public_key=""
   while [[ -z "$entry_public_key" ]]; do
-    read -rp "请输入【入口服务器公钥】: " entry_public_key
+    read -rp "请输入【入口服务器公钥】(去入口服务器脚本里复制): " entry_public_key
     [[ -z "$entry_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
   done
 
@@ -653,6 +649,22 @@ configure_entry() {
   install_base_packages
   install_wireguard
   install_wstunnel
+
+  # 提前生成并展示本机的公钥（防止两边死锁）
+  cd "$WG_DIR"
+  if [[ ! -f entry_private.key ]]; then
+    umask 077
+    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
+  fi
+  local entry_public_key
+  entry_public_key="$(cat entry_public.key)"
+  echo ""
+  echo -e "\033[44;37m =============================================== \033[0m"
+  echo -e "\033[44;37m 🔑 【本机（入口服务器）公钥】请复制并保存好：   \033[0m"
+  echo -e "\033[34m${entry_public_key}\033[0m"
+  echo -e "\033[44;37m =============================================== \033[0m"
+  echo ""
+
   local wg_addr exit_wg_ip 
   local ws_port path_prefix verify_tls
   local local_udp_port remote_wg_udp_port
@@ -672,10 +684,9 @@ configure_entry() {
   [[ -f "$WST_PATH_FILE" ]] && saved_path="$(cat "$WST_PATH_FILE" 2>/dev/null || true)"
   [[ -f "$WST_VERIFY_FILE" ]] && saved_verify="$(cat "$WST_VERIFY_FILE" 2>/dev/null || true)"
   
-  # 强制必填：出口服务器域名
   local exit_host=""
   while [[ -z "$exit_host" ]]; do
-    read -rp "出口服务器域名 / IP (默认 ${saved_host:-}): " exit_host
+    read -rp "出口服务器域名/IP (如果是域名套了CDN也能连): " exit_host
     exit_host="${exit_host:-$saved_host}"
     [[ -z "$exit_host" ]] && echo "❌ 出口服务器地址不能为空，请重新输入！"
   done
@@ -683,7 +694,7 @@ configure_entry() {
   read -rp "wss 端口 (默认 ${saved_port:-443}): " ws_port
   ws_port="${ws_port:-${saved_port:-443}}"
   read -rp "路径前缀 (默认 ${saved_path:-自动生成}): " path_prefix
-  path_prefix="${path_prefix:-${saved_path:-$(rand_str || echo "v1")}}"
+  path_prefix="${path_prefix:-${saved_path:-$(rand_str)}}"
   read -rp "是否严格校验证书? (Y/n，正式域名证书建议 Y): " verify_tls
   verify_tls="${verify_tls:-Y}"
   read -rp "入口本地 wstunnel 监听 UDP 端口 (默认 ${WST_LOCAL_UDP_PORT_DEFAULT}): " local_udp_port
@@ -694,14 +705,9 @@ configure_entry() {
   save_wst_params "$exit_host" "$ws_port" "$path_prefix" "$verify_tls"
   setup_entry_wstunnel_service "$exit_host" "$ws_port" "$path_prefix" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
   
-  if [[ -f "${WG_DIR}/entry_public.key" ]]; then
-    cat "${WG_DIR}/entry_public.key" 2>/dev/null || true
-  fi
-  
-  # 强制必填：出口服务器公钥
   local exit_public_key=""
   while [[ -z "$exit_public_key" ]]; do
-    read -rp "请输入【出口服务器公钥】: " exit_public_key
+    read -rp "请输入【出口服务器公钥】(去出口服务器脚本里复制): " exit_public_key
     [[ -z "$exit_public_key" ]] && echo "❌ 公钥不能为空，请重新输入！"
   done
 
@@ -819,7 +825,6 @@ update_wstunnel_entry_remote_ip() {
   [[ -f "$WST_LOCAL_UDP_PORT_FILE" ]] && local_udp_port="$(cat "$WST_LOCAL_UDP_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_WG_UDP_PORT_FILE" ]] && remote_wg_udp_port="$(cat "$WST_WG_UDP_PORT_FILE" 2>/dev/null || true)"
   
-  # 强制必填：修改时的出口地址
   local new_host=""
   while [[ -z "$new_host" ]]; do
     read -rp "新出口域名 / IP: " new_host
