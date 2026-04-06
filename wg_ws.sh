@@ -314,13 +314,13 @@ build_singbox_routes() {
     if [[ "$ports_json" == "[]" ]]; then
       /usr/bin/jq '.route.rules = [
         {"port": [22], "outbound": "direct"},
-        {"inbound": ["tun-in"], "outbound": "direct"}
+        {"outbound": "direct"}
       ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
     else
       /usr/bin/jq --argjson p "$ports_json" '.route.rules = [
         {"port": [22], "outbound": "direct"},
         {"inbound": ["tun-in"], "port": $p, "outbound": "reality-out"},
-        {"inbound": ["tun-in"], "outbound": "direct"}
+        {"outbound": "direct"}
       ]' "${SING_DIR}/config.json" > "${SING_DIR}/config.json.tmp"
     fi
   fi
@@ -443,7 +443,7 @@ WantedBy=multi-user.target
 EOF
 
   systemctl daemon-reload
-  systemctl enable singbox-entry.service
+  systemctl enable --now singbox-entry.service
   echo "✅ 入口 Reality 客户端已启动（TUN 全局/分流模式）"
 }
 
