@@ -245,8 +245,6 @@ write_nginx_https_wstunnel_site() {
     https_redirect_target="https://\$host:${https_port}\$request_uri"
   fi
 
-  # ==========================================
-
   cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
