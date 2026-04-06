@@ -7,7 +7,7 @@ PORT_LIST_FILE="${WG_DIR}/.wg_ports"
 MODE_FILE="${WG_DIR}/.wg_mode"
 EXIT_WG_IP_FILE="${WG_DIR}/.exit_wg_ip"
 ROLE_FILE="${WG_DIR}/.wg_role"
-INSTALLED_PKGS_FILE="${WG_DIR}/.installed_pkgs" # 新增：记录脚本安装的依赖
+INSTALLED_PKGS_FILE="${WG_DIR}/.installed_pkgs"
 WST_DIR="/etc/wstunnel"
 WSTUNNEL_BIN="/usr/local/bin/wstunnel"
 WSTUNNEL_VERSION="10.5.2"
@@ -54,7 +54,7 @@ rand_str() {
 detect_public_ip() {
   local ip=""
   for svc in "https://api.ipify.org" "https://ifconfig.me" "https://ipinfo.io/ip"; do
-    ip=$(curl -4 -fsS --max-time 3 "$svc" 2>/dev/null || true)
+    ip=$(curl -4 -fsS --max-time 3 "$svc" </dev/null 2>/dev/null || true)
     if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
       echo "$ip"
       return 0
@@ -123,10 +123,10 @@ install_base_packages() {
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
-  apt update
-  apt install -y "${missing[@]}"
+  apt update </dev/null || true
+  # 关键修复：加入 </dev/null 防止 apt 吞噬终端复制粘贴的剩余脚本
+  apt install -y "${missing[@]}" </dev/null
   
-  # 记录真正由本脚本安装的依赖
   ensure_dirs
   for pkg in "${missing[@]}"; do
     echo "$pkg" >> "$INSTALLED_PKGS_FILE"
@@ -143,10 +143,10 @@ install_wireguard() {
     return 0
   fi
   export DEBIAN_FRONTEND=noninteractive
-  apt update
-  apt install -y "${missing[@]}"
+  apt update </dev/null || true
+  # 关键修复：加入 </dev/null 防止 apt 吞噬终端复制粘贴的剩余脚本
+  apt install -y "${missing[@]}" </dev/null
 
-  # 记录真正由本脚本安装的依赖
   ensure_dirs
   for pkg in "${missing[@]}"; do
     echo "$pkg" >> "$INSTALLED_PKGS_FILE"
@@ -168,24 +168,34 @@ install_wstunnel() {
     x86_64|amd64) file="wstunnel_${WSTUNNEL_VERSION}_linux_amd64.tar.gz" ;;
     aarch64|arm64) file="wstunnel_${WSTUNNEL_VERSION}_linux_arm64.tar.gz" ;;
     armv7l|armv6l) file="wstunnel_${WSTUNNEL_VERSION}_linux_armv6.tar.gz" ;;
-    *) exit 1 ;;
+    *) echo "❌ 暂不支持的架构: $arch"; exit 1 ;;
   esac
   url_base="https://github.com/erebe/wstunnel/releases/download/v${WSTUNNEL_VERSION}"
   url_bin="${url_base}/${file}"
   url_sum="${url_base}/wstunnel_${WSTUNNEL_VERSION}_checksums.txt"
   tmpdir="$(mktemp -d)"
+  
+  echo "⏳ 正在从 GitHub 下载 wstunnel，请稍候..."
   (
     cd "$tmpdir"
-    curl -sL --fail "$url_sum" -o checksums.txt
-    curl -L --fail "$url_bin" -o "$file"
+    if ! curl -sL --fail "$url_sum" -o checksums.txt </dev/null; then
+       echo "❌ 下载校验文件失败！请检查网络。"
+       exit 1
+    fi
+    if ! curl -L --fail "$url_bin" -o "$file" </dev/null; then
+       echo "❌ 下载 wstunnel 失败！请检查网络。"
+       exit 1
+    fi
     if ! grep "$file" checksums.txt | sha256sum -c -; then
+       echo "❌ 文件校验失败！"
        exit 1
     fi
     tar -xzf "$file"
     bin_name="$(find . -maxdepth 1 -type f \( -name "wstunnel" -o -name "wstunnel-cli" \) | head -n1)"
     install -m 0755 "$bin_name" "$WSTUNNEL_BIN"
-  )
+  ) || exit 1
   rm -rf "$tmpdir"
+  echo "✅ wstunnel 安装完成。"
 }
 
 write_nginx_http_site_for_acme() {
@@ -215,7 +225,7 @@ EOF
 
 issue_letsencrypt_cert() {
   local domain="$1"
-  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect
+  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect </dev/null
 }
 
 write_nginx_https_wstunnel_site() {
@@ -799,7 +809,7 @@ renew_cert_now() {
     return
   fi
   install_certbot
-  certbot renew --nginx
+  certbot renew --nginx </dev/null
   nginx -t && systemctl reload nginx
 }
 
@@ -831,15 +841,13 @@ uninstall_wg() {
   read -rp "是否连同Nginx伪装站点以及TLS证书一起彻底抹除？[y/N (默认N)]: " del_cert
   del_cert="${del_cert:-N}"
 
-  # 1. 先安全清理我们的特定配置文件，而不去碰系统的全局配置
   if [[ "$del_cert" =~ ^[yY]$ ]]; then
     if [[ -f "$WST_DOMAIN_FILE" ]]; then
         local d
         d="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
         if [[ -n "$d" ]]; then
            rm -rf "${WEB_ROOT_BASE}/${d}" 2>/dev/null || true
-           # 安全地仅删除该域名的证书，不破坏 certbot 其他域名的证书
-           certbot delete --cert-name "$d" --non-interactive 2>/dev/null || true
+           certbot delete --cert-name "$d" --non-interactive </dev/null 2>/dev/null || true
         fi
     fi
     if [[ -f "$WST_NGINX_SITE_FILE" ]]; then
@@ -864,12 +872,10 @@ uninstall_wg() {
     fi
   fi
 
-  # 2. 动态卸载我们在安装时补充安装的依赖
   if [[ -f "$INSTALLED_PKGS_FILE" ]]; then
     local pkgs_to_remove=()
     while read -r pkg; do
       [[ -z "$pkg" ]] && continue
-      # 如果用户选择不删证书，那么我们要从待卸载列表中剔除 nginx 和 certbot 相关的包
       if [[ ! "$del_cert" =~ ^[yY]$ ]] && [[ "$pkg" =~ nginx|certbot ]]; then
         continue
       fi
@@ -878,8 +884,8 @@ uninstall_wg() {
 
     if [[ ${#pkgs_to_remove[@]} -gt 0 ]]; then
       echo "⏳ 正在卸载由脚本安装的依赖: ${pkgs_to_remove[*]}"
-      apt purge -y "${pkgs_to_remove[@]}" 2>/dev/null || true
-      apt autoremove -y 2>/dev/null || true
+      apt purge -y "${pkgs_to_remove[@]}" </dev/null 2>/dev/null || true
+      apt autoremove -y </dev/null 2>/dev/null || true
     fi
   fi
 
