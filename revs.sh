@@ -53,8 +53,12 @@ set_role() {
   echo "$role" > "$ROLE_FILE"
 }
 
-rand_str() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 16
+gen_short_id() {
+  if cmd_exists openssl; then
+    openssl rand -hex 4 | tr 'A-F' 'a-f'
+  else
+    hexdump -n 4 -ve '/1 "%02x"' /dev/urandom
+  fi
 }
 
 detect_public_ip() {
@@ -94,6 +98,7 @@ install_base_packages() {
   cmd_exists jq || pkgs+=("jq")
   cmd_exists nginx || pkgs+=("nginx")
   cmd_exists certbot || pkgs+=("certbot")
+  cmd_exists openssl || pkgs+=("openssl")
 
   if ! dpkg -s python3-certbot-nginx >/dev/null 2>&1; then
     pkgs+=("python3-certbot-nginx")
@@ -101,10 +106,6 @@ install_base_packages() {
 
   if ! dpkg -s ca-certificates >/dev/null 2>&1; then
     pkgs+=("ca-certificates")
-  fi
-
-  if ! dpkg -s openssl >/dev/null 2>&1; then
-    pkgs+=("openssl")
   fi
 
   if [[ "${#pkgs[@]}" -gt 0 ]]; then
@@ -747,12 +748,18 @@ configure_exit() {
     echo "❌ 域名不能为空，请重新输入。"
   done
 
-  short_id="$(rand_str)"
+  short_id="$(gen_short_id)"
   uuid="$(cat /proc/sys/kernel/random/uuid)"
 
   keypair="$(${SING_BIN} generate reality-keypair)"
   private_key="$(echo "$keypair" | awk '/PrivateKey/ {print $2}')"
   public_key="$(echo "$keypair" | awk '/PublicKey/ {print $2}')"
+
+  if [[ -z "${private_key:-}" || -z "${public_key:-}" ]]; then
+    echo "❌ 生成 Reality 密钥失败"
+    echo "$keypair"
+    return 1
+  fi
 
   echo "$domain" > "${SING_DIR}/domain"
   echo "$short_id" > "${SING_DIR}/short_id"
@@ -793,8 +800,8 @@ configure_entry() {
   while true; do
     read -rp "short_id: " short_id
     short_id="$(trim "$short_id")"
-    [[ -n "$short_id" ]] && break
-    echo "❌ short_id 不能为空，请重新输入。"
+    [[ "$short_id" =~ ^[a-fA-F0-9]{1,8}$ ]] && { short_id="${short_id,,}"; break; }
+    echo "❌ short_id 必须是 1-8 位十六进制字符，请重新输入。"
   done
 
   while true; do
@@ -1043,7 +1050,7 @@ uninstall() {
   echo "[*] 清理残留临时文件..."
   rm -f /tmp/sing-box*.tar.gz /tmp/sing-box*.tmp 2>/dev/null || true
 
-  echo "✅ 已彻底卸载：sing-box / nginx / certbot 已删除，curl 与 jq 保留"
+  echo "✅ 已彻底卸载：sing-box / nginx / certbot 已删除"
   exit 0
 }
 
