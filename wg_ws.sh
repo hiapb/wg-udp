@@ -1099,8 +1099,10 @@ configure_exit() {
 
   cd "$WG_DIR"
   if [[ ! -f exit_private.key ]]; then
-    umask 077
-    wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+    (
+      umask 077
+      wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+    )
   fi
   local exit_public_key
   exit_public_key="$(cat exit_public.key)"
