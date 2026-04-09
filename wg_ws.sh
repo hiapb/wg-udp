@@ -219,7 +219,6 @@ EOF
   echo "$site_file" > "$WST_NGINX_SITE_FILE"
 }
 
-# 【改动1：改造证书申请函数，增加状态返回，而非报错直接退出】
 issue_letsencrypt_cert() {
   local domain="$1"
   print_step "证书" "正在申请 HTTPS 证书: ${domain}"
@@ -236,6 +235,7 @@ write_nginx_https_wstunnel_site() {
   local backend_port="$2"
   local path_prefix="$3"
   local https_port="$4"
+  local template_id="$5"
 
   local site_file="${NGINX_SITE_DIR}/${domain}.conf"
   local web_root="${WEB_ROOT_BASE}/${domain}"
@@ -250,7 +250,10 @@ write_nginx_https_wstunnel_site() {
     https_redirect_target="https://\$host:${https_port}\$request_uri"
   fi
 
-  cat > "$web_root/index.html" <<'EOF'
+  case "$template_id" in
+    1)
+      # 模板 1：100% 还原您的原版 VDI 虚拟桌面网关（含完整动画与模拟等待机制）
+      cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
 <head>
@@ -452,6 +455,221 @@ write_nginx_https_wstunnel_site() {
 </body>
 </html>
 EOF
+      ;;
+    2)
+      # 模板 2：高仿真 API 网关调试台 (Swagger 风格 - 含异步 JSON 数据回显伪装)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Graph API Services - Developer Portal</title>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #fafafa; margin: 0; padding: 0; color: #3b4151; }
+  .topbar { background: #1b1b1b; padding: 15px 30px; color: #fff; font-size: 1.2rem; font-weight: bold; display: flex; align-items: center;}
+  .topbar span { color: #89bf04; margin-left: 10px; }
+  .container { max-width: 1000px; margin: 40px auto; padding: 0 20px; }
+  .info { margin-bottom: 30px; }
+  .info h2 { font-size: 36px; margin: 0 0 10px 0; }
+  .info p { color: #555; }
+  .endpoint { border: 1px solid #ccc; border-radius: 4px; margin-bottom: 15px; background: #fff; overflow: hidden; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+  .ep-header { padding: 15px; cursor: pointer; display: flex; align-items: center; border-bottom: 1px solid transparent; transition: background 0.2s;}
+  .ep-header:hover { background: #f4f4f4; }
+  .method { padding: 6px 12px; border-radius: 3px; font-weight: bold; color: #fff; margin-right: 15px; font-size: 14px;}
+  .method.get { background: #61affe; }
+  .method.post { background: #49cc90; }
+  .path { font-family: monospace; font-size: 16px; font-weight: bold; }
+  .ep-body { padding: 20px; display: none; border-top: 1px solid #eee; background: #fdfdfd;}
+  .btn { padding: 8px 16px; background: #49cc90; color: #fff; border: none; border-radius: 3px; cursor: pointer; font-weight: bold; transition: background 0.2s;}
+  .btn:hover { background: #3ba172; }
+  .btn:disabled { background: #ccc; cursor: not-allowed; }
+  .response-area { margin-top: 15px; background: #333; color: #0f0; padding: 15px; border-radius: 4px; font-family: monospace; display: none; white-space: pre-wrap; word-break: break-all;}
+  .loader { display: inline-block; width: 12px; height: 12px; border: 2px solid #fff; border-radius: 50%; border-top-color: transparent; animation: spin 1s linear infinite; margin-left: 5px; vertical-align: middle; display: none;}
+  @keyframes spin { 100% { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="topbar">swagger <span>hub</span></div>
+<div class="container">
+  <div class="info">
+    <h2>Core Data Exchange API <small>v3.1.0</small></h2>
+    <p>[ Base URL: api.core-services.internal/v3 ]<br>Production endpoint for GraphQL and REST data mutations.</p>
+  </div>
+  
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggleBody(this)">
+      <span class="method get">GET</span><span class="path">/healthz</span>
+    </div>
+    <div class="ep-body">
+      <p>Returns the health status of the load balancer and backend workers.</p>
+      <button class="btn" onclick="executeMock(this, '{\n  \"status\": \"UP\",\n  \"components\": {\n    \"db\": {\"status\": \"UP\"},\n    \"redis\": {\"status\": \"UP\"}\n  }\n}')">
+        Try it out <span class="loader"></span>
+      </button>
+      <div class="response-area"></div>
+    </div>
+  </div>
+
+  <div class="endpoint">
+    <div class="ep-header" onclick="toggleBody(this)">
+      <span class="method post">POST</span><span class="path">/v3/graphql/stream</span>
+    </div>
+    <div class="ep-body">
+      <p>Establish an authenticated WebSocket stream for realtime data. Requires Bearer Token.</p>
+      <button class="btn" onclick="executeMock(this, '{\n  \"error\": \"invalid_grant\",\n  \"error_description\": \"The provided authorization grant is invalid, expired, or revoked\",\n  \"trace_id\": \"req_39f82a1b\"\n}')">
+        Execute <span class="loader"></span>
+      </button>
+      <div class="response-area"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+  function toggleBody(el) {
+    const body = el.nextElementSibling;
+    body.style.display = body.style.display === 'block' ? 'none' : 'block';
+  }
+
+  function executeMock(btn, jsonStr) {
+    const loader = btn.querySelector('.loader');
+    const respArea = btn.nextElementSibling;
+    
+    btn.disabled = true;
+    loader.style.display = 'inline-block';
+    respArea.style.display = 'none';
+    respArea.innerText = '';
+
+    // 模拟真实的网络延迟与执行特征图
+    setTimeout(() => {
+      btn.disabled = false;
+      loader.style.display = 'none';
+      respArea.style.display = 'block';
+      
+      // 逐字打印效果，增加 DOM 操作复杂度骗过特征检测
+      let i = 0;
+      respArea.innerText = "HTTP/1.1 401 Unauthorized\nContent-Type: application/json\n\n";
+      const interval = setInterval(() => {
+        respArea.innerText += jsonStr.charAt(i);
+        i++;
+        if(i >= jsonStr.length) clearInterval(interval);
+      }, 5);
+      
+    }, Math.floor(Math.random() * 800) + 600);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    3)
+      # 模板 3：高仿真对象存储控制台 (MinIO 风格 - 模拟 React 状态流转与网络超时)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloud Storage Object Browser</title>
+<style>
+  body { background: #0f172a; margin: 0; font-family: system-ui, -apple-system, sans-serif; display: flex; height: 100vh; justify-content: center; align-items: center; color: #f8fafc;}
+  .login-box { background: #1e293b; padding: 40px; border-radius: 8px; box-shadow: 0 10px 25px rgba(0,0,0,0.5); width: 380px; text-align: center; border-top: 4px solid #c2410c; position: relative;}
+  h2 { margin-top: 0; font-weight: 500; font-size: 22px; margin-bottom: 30px; letter-spacing: 0.5px;}
+  .input-group { margin-bottom: 20px; text-align: left;}
+  .input-group label { display: block; font-size: 12px; color: #94a3b8; margin-bottom: 6px; text-transform: uppercase;}
+  input { width: 100%; padding: 12px; box-sizing: border-box; background: #0f172a; border: 1px solid #334155; color: #fff; border-radius: 4px; outline: none; transition: all 0.2s; font-family: monospace;}
+  input:focus { border-color: #ea580c; box-shadow: 0 0 0 2px rgba(234, 88, 12, 0.2);}
+  button { width: 100%; padding: 12px; background: #ea580c; color: white; border: none; border-radius: 4px; font-size: 15px; font-weight: 600; cursor: pointer; transition: background 0.2s; display: flex; justify-content: center; align-items: center; gap: 8px;}
+  button:hover:not(:disabled) { background: #c2410c; }
+  button:disabled { background: #64748b; cursor: not-allowed; opacity: 0.7;}
+  .footer-text { margin-top: 25px; color: #64748b; font-size: 12px; }
+  
+  .error-toast { background: #7f1d1d; color: #fecaca; padding: 12px; border-radius: 4px; font-size: 13px; text-align: left; margin-bottom: 20px; border-left: 4px solid #ef4444; display: none; animation: slideDown 0.3s ease-out;}
+  @keyframes slideDown { from { transform: translateY(-10px); opacity: 0;} to { transform: translateY(0); opacity: 1;} }
+  
+  .spinner { width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.3); border-radius: 50%; border-top-color: #fff; animation: spin 1s ease-in-out infinite; display: none;}
+  @keyframes spin { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h2>Bucket Access Console</h2>
+  
+  <div class="error-toast" id="errToast"></div>
+
+  <div class="input-group">
+    <label>Access Key</label>
+    <input type="text" id="ak" autocomplete="off">
+  </div>
+  <div class="input-group">
+    <label>Secret Key</label>
+    <input type="password" id="sk">
+  </div>
+  
+  <button id="authBtn" onclick="attemptAuth()">
+    <div class="spinner" id="btnSpn"></div>
+    <span id="btnTxt">Sign In</span>
+  </button>
+  
+  <div class="footer-text">S3 Compatible API Endpoint Active v.RELEASE.2026-03-01</div>
+</div>
+
+<script>
+  function attemptAuth() {
+    const ak = document.getElementById('ak').value;
+    const sk = document.getElementById('sk').value;
+    const btn = document.getElementById('authBtn');
+    const spn = document.getElementById('btnSpn');
+    const txt = document.getElementById('btnTxt');
+    const toast = document.getElementById('errToast');
+
+    if(!ak || !sk) {
+      toast.innerText = "Validation Error: Access Key and Secret Key are required.";
+      toast.style.display = 'block';
+      return;
+    }
+
+    toast.style.display = 'none';
+    btn.disabled = true;
+    spn.style.display = 'block';
+    txt.innerText = 'Authenticating...';
+
+    // 模拟服务端验证耗时与高密度 DOM 状态流转
+    setTimeout(() => {
+      btn.disabled = false;
+      spn.style.display = 'none';
+      txt.innerText = 'Sign In';
+      
+      toast.innerText = "S3 API Error (403): SignatureDoesNotMatch. The request signature we calculated does not match the signature you provided.";
+      toast.style.display = 'block';
+    }, 1250);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    4)
+      # 模板 4：Nginx 极简欢迎页 (无主之地 - 绝对纯净静态，无 JS，彻底隐身于互联网的本底噪声中)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+<title>Welcome to nginx!</title>
+<style>
+    body { width: 35em; margin: 0 auto; font-family: Tahoma, Verdana, Arial, sans-serif; margin-top: 50px;}
+</style>
+</head>
+<body>
+<h1>Welcome to nginx!</h1>
+<p>If you see this page, the nginx web server is successfully installed and working. Further configuration is required.</p>
+<p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
+Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
+<p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+EOF
+      ;;
+  esac
 
   {
     echo "User-agent: *"
@@ -1122,7 +1340,6 @@ configure_exit() {
   print_block "【本机（出口服务器）公钥】"
   echo "$exit_public_key"
 
-  # 【改动2：增加防退出闭环，失败则清理脏配置并重新要求输入】
   local domain=""
   while true; do
     read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
@@ -1142,8 +1359,19 @@ configure_exit() {
       print_warn "正在自动清理刚才生成的无效 Nginx 配置文件..."
       rm -f "${NGINX_SITE_DIR}/${domain}.conf" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
       systemctl reload nginx >/dev/null 2>&1 || true
-      domain="" # 清空变量，强制进入下一次循环
+      domain=""
     fi
+  done
+
+  print_block "🛡️ 节点防指纹伪装模板选择"
+  echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 您的高仿原版)"
+  echo "2) ⚙️ API 调试文档 (Swagger UI - 含异步 JSON 回显)"
+  echo "3) 🗄️ 对象存储控制台 (MinIO - 含动态状态流转)"
+  echo "4) 🌐 极简欢迎页 (Nginx 默认 - 绝对纯净无代码)"
+  local template_id=""
+  while [[ ! "$template_id" =~ ^[1-4]$ ]]; do
+    read -rp "请选择伪装策略 [1-4] (默认 1): " template_id
+    template_id="${template_id:-1}"
   done
 
   local wg_addr entry_wg_ip out_if ws_port wg_udp_port backend_port path_prefix default_if
@@ -1169,7 +1397,7 @@ configure_exit() {
   path_prefix="$(normalize_path_prefix "${path_prefix:-${recommended_path}}")"
 
   print_step "站点" "写入 HTTPS + wstunnel 反代配置..."
-  write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix" "$ws_port"
+  write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix" "$ws_port" "$template_id"
 
   local entry_public_key=""
   while [[ -z "$entry_public_key" ]]; do
@@ -1186,6 +1414,7 @@ configure_exit() {
 
   print_block "✅ 出口配置完成"
   echo "域名: ${domain}"
+  echo "伪装: 模板 ${template_id}"
   echo "WSS端口: ${ws_port}"
   echo "WG UDP端口: ${wg_udp_port}"
   echo
