@@ -252,7 +252,6 @@ write_nginx_https_wstunnel_site() {
 
   case "$template_id" in
     1)
-      # 模板 1：100% 还原您的原版 VDI 虚拟桌面网关（含完整动画与模拟等待机制）
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -457,7 +456,6 @@ write_nginx_https_wstunnel_site() {
 EOF
       ;;
     2)
-      # 模板 2：高仿真 API 网关调试台 (Swagger 风格 - 含异步 JSON 数据回显伪装)
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -1364,7 +1362,7 @@ configure_exit() {
   done
 
   print_block "🛡️ 节点防指纹伪装模板选择"
-  echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 您的高仿原版)"
+  echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 企业级动态交互版)"
   echo "2) ⚙️ API 调试文档 (Swagger UI - 含异步 JSON 回显)"
   echo "3) 🗄️ 对象存储控制台 (MinIO - 含动态状态流转)"
   echo "4) 🌐 极简欢迎页 (Nginx 默认 - 绝对纯净无代码)"
