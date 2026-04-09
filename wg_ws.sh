@@ -230,25 +230,12 @@ issue_letsencrypt_cert() {
   fi
 }
 
-write_nginx_https_wstunnel_site() {
+# 【新增：将模板生成引擎解耦封装，用于实时热切换】
+apply_html_template() {
   local domain="$1"
-  local backend_port="$2"
-  local path_prefix="$3"
-  local https_port="$4"
-  local template_id="$5"
-
-  local site_file="${NGINX_SITE_DIR}/${domain}.conf"
+  local template_id="$2"
   local web_root="${WEB_ROOT_BASE}/${domain}"
-  local https_redirect_target
-
-  path_prefix="$(normalize_path_prefix "$path_prefix")"
   mkdir -p "$web_root"
-
-  if [[ "$https_port" == "443" ]]; then
-    https_redirect_target="https://\$host\$request_uri"
-  else
-    https_redirect_target="https://\$host:${https_port}\$request_uri"
-  fi
 
   case "$template_id" in
     1)
@@ -1002,6 +989,32 @@ EOF
 EOF
       ;;
   esac
+  # 记录当前部署的模板ID
+  mkdir -p "${WST_DIR}"
+  echo "$template_id" > "${WST_DIR}/template_id"
+}
+
+write_nginx_https_wstunnel_site() {
+  local domain="$1"
+  local backend_port="$2"
+  local path_prefix="$3"
+  local https_port="$4"
+  local template_id="$5"
+
+  local site_file="${NGINX_SITE_DIR}/${domain}.conf"
+  local web_root="${WEB_ROOT_BASE}/${domain}"
+  local https_redirect_target
+
+  path_prefix="$(normalize_path_prefix "$path_prefix")"
+  
+  # 调用核心模板引擎写入对应 UI
+  apply_html_template "$domain" "$template_id"
+
+  if [[ "$https_port" == "443" ]]; then
+    https_redirect_target="https://\$host\$request_uri"
+  else
+    https_redirect_target="https://\$host:${https_port}\$request_uri"
+  fi
 
   {
     echo "User-agent: *"
@@ -1586,9 +1599,119 @@ renew_cert_now() {
   print_ok "证书续期执行完成"
 }
 
-manage_certificates() {
+# 【新增：域名热切换核心逻辑】
+change_exit_domain() {
+  local old_domain
+  old_domain="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+  if [[ -z "$old_domain" ]]; then
+    print_err "未找到当前域名配置，请确认出口已部署"
+    return 1
+  fi
+
+  print_block "🌐 出口域名热切换"
+  echo "当前域名: ${old_domain}"
+  local new_domain=""
+  while true; do
+    read -rp "请输入新的出口域名 (必须已解析到本机): " new_domain
+    if [[ -z "$new_domain" ]]; then
+      print_err "新域名不能为空"
+      continue
+    fi
+    if [[ "$new_domain" == "$old_domain" ]]; then
+      print_warn "新域名与旧域名相同，取消操作"
+      return 0
+    fi
+    break
+  done
+
+  print_step "证书" "正在为新域名申请证书..."
+  write_nginx_http_site_for_acme "$new_domain"
+  
+  if ! issue_letsencrypt_cert "$new_domain"; then
+    print_err "证书申请失败！热切换已中止，您的旧域名及节点配置未受任何影响。"
+    print_warn "正在清理临时的验证配置文件..."
+    rm -f "${NGINX_SITE_DIR}/${new_domain}.conf" "${NGINX_SITE_ENABLED_DIR}/${new_domain}.conf"
+    systemctl reload nginx >/dev/null 2>&1 || true
+    return 1
+  fi
+
+  print_step "重构" "正在克隆内核级 Nginx 配置并平滑转移状态..."
+  # 克隆物理目录
+  cp -a "/var/www/${old_domain}" "/var/www/${new_domain}"
+  
+  # 克隆 Nginx 配置，并通过 sed 实现精确语义替换
+  cat "/etc/nginx/sites-available/${old_domain}.conf" | sed "s/${old_domain}/${new_domain}/g" > "/etc/nginx/sites-available/${new_domain}.conf"
+  
+  # 生效新域名并平滑卸载旧域名
+  ln -sf "/etc/nginx/sites-available/${new_domain}.conf" "${NGINX_SITE_ENABLED_DIR}/${new_domain}.conf"
+  rm -f "${NGINX_SITE_ENABLED_DIR}/${old_domain}.conf"
+  
+  # Nginx 平滑重载 Worker 进程，实现零掉线接管
+  nginx -t >/dev/null && systemctl reload nginx
+
+  # 更新底层参数
+  echo "$new_domain" > "$WST_DOMAIN_FILE"
+  echo "/etc/nginx/sites-available/${new_domain}.conf" > "$WST_NGINX_SITE_FILE"
+  
+  # 清理旧目录
+  rm -rf "/var/www/${old_domain}"
+
+  print_ok "域名已成功热切换为: ${new_domain}"
+  echo
+  print_warn "【极端重要】您的出口域名已变更为 ${new_domain}"
+  print_warn "请务必登录您的【入口服务器】，运行本脚本，选择菜单 10 (修改出口 IP / 域名)，将其指向新域名，否则隧道将无法连接！"
+  echo
+
+  read -rp "是否彻底从本地系统删除旧域名(${old_domain})的 Let's Encrypt 证书？(y/N): " del_old
+  if [[ "$del_old" =~ ^[Yy]$ ]]; then
+    certbot delete --cert-name "$old_domain" --non-interactive >/dev/null 2>&1 || true
+    rm -rf "/etc/letsencrypt/live/${old_domain}" "/etc/letsencrypt/archive/${old_domain}" "/etc/letsencrypt/renewal/${old_domain}.conf" 2>/dev/null || true
+    print_ok "旧证书已销毁"
+  fi
+}
+
+# 【新增：独立的前端伪装引擎控制台】
+manage_exit_template() {
+  local current_id
+  current_id="$(cat "${WST_DIR}/template_id" 2>/dev/null || echo "未知 (可能是早期部署版本)")"
+  
+  print_block "🛡️ 伪装模板热轮换"
+  echo "当前运行的模板 ID: [ ${current_id} ]"
+  echo "------------------------------------------------"
+  echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 企业级动态交互版)"
+  echo "2) ⚙️ API 调试文档 (Swagger UI - 含异步 JSON 回显)"
+  echo "3) 🗄️ 对象存储控制台 (MinIO - 含动态状态流转)"
+  echo "4) 🌐 极简欢迎页 (Nginx 默认 - 绝对纯净无代码)"
+  echo "5) 📈 数据大屏面板 (Grafana 风格 - 掩护高频心跳)"
+  echo "6) 🎥 安防视频网关 (WebRTC 风格 - 掩护大带宽/UDP)"
+  echo "7) 💻 Web 终端堡垒机 (WebSSH 风格 - 掩护长连接交互)"
+  echo "8) ☁️ 企业私有云盘 (ownCloud 风格 - 掩护突发双向大流量)"
+  echo "9) 🚀 自动化流水线 (CI/CD 风格 - 掩护大突发+实时日志流)"
+  echo "10) 🏠 智能家居中枢 (Home Assistant 风格 - 掩护全天候活跃)"
+  echo "0) 返回上一级"
+  
+  local template_id=""
+  read -rp "请选择要无缝切换的伪装策略 [0-10]: " template_id
+  if [[ "$template_id" == "0" ]]; then return; fi
+  
+  if [[ "$template_id" =~ ^([1-9]|10)$ ]]; then
+    local domain
+    domain="$(cat "$WST_DOMAIN_FILE" 2>/dev/null || true)"
+    if [[ -n "$domain" ]]; then
+      apply_html_template "$domain" "$template_id"
+      print_ok "伪装模板已瞬间切换为: 模板 ${template_id}"
+      echo "您可以直接在浏览器刷新域名查看最新效果，无需重启任何服务。"
+    else
+      print_err "未找到域名配置，请确认出口已部署"
+    fi
+  else
+    print_err "无效的选择"
+  fi
+}
+
+manage_exit_node() {
   if [[ "$(get_role)" != "exit" ]]; then
-    print_err "仅出口服务器可用"
+    print_err "该功能仅限在【出口服务器】上使用"
     return
   fi
 
@@ -1598,15 +1721,18 @@ manage_certificates() {
   fi
 
   while true; do
-    print_block "证书管理（仅出口）"
-    echo "当前绑定域名: ${domain:-未配置}"
-    echo "1) 查看证书情况"
-    echo "2) 开启自动续签"
-    echo "3) 关闭自动续签"
-    echo "4) 手动立即续签"
-    echo "5) 删除证书"
+    print_block "出口高级管理 (证书 / 域名热切换 / 伪装)"
+    echo "当前出口域名: ${domain:-未配置}"
+    echo "------------------------------------------------"
+    echo "1) 🔍 查看当前 HTTPS 证书情况"
+    echo "2) 🟢 开启自动续签"
+    echo "3) 🔴 关闭自动续签"
+    echo "4) ⏳ 立即强制手动续签"
+    echo "5) 🗑️ 强制删除当前证书"
+    echo "6) 🌐 域名热切换"
+    echo "7) 🛡️ 伪装模板管理"
     echo "0) 返回上一级"
-    read -rp "请选择: " sub
+    read -rp "请选择高级操作: " sub
 
     case "$sub" in
       1)
@@ -1627,23 +1753,23 @@ manage_certificates() {
         systemctl stop certbot.timer >/dev/null 2>&1 || true
         print_ok "已关闭自动续签定时任务 (certbot.timer)"
         ;;
-      4)
-        renew_cert_now
-        ;;
+      4) renew_cert_now ;;
       5)
         if [[ -n "$domain" ]]; then
-          read -rp "⚠️ 确定要删除 ${domain} 的证书吗？会导致服务中断 (y/N): " confirm
+          read -rp "⚠️ 确定要物理销毁 ${domain} 的证书吗？这会导致 WSS 隧道瘫痪 (y/N): " confirm
           if [[ "$confirm" =~ ^[Yy]$ ]]; then
             certbot delete --cert-name "$domain" --non-interactive >/dev/null 2>&1 || true
             rm -rf "/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/archive/${domain}" "/etc/letsencrypt/renewal/${domain}.conf" 2>/dev/null || true
-            print_ok "证书已成功删除"
+            print_ok "证书已被不可逆销毁"
           else
-            echo "已取消删除操作"
+            echo "已取消操作"
           fi
         else
-          print_warn "未找到绑定的域名，无法删除"
+          print_warn "未找到域名配置"
         fi
         ;;
+      6) change_exit_domain ;;
+      7) manage_exit_template ;;
       0) break ;;
       *) print_err "无效选择" ;;
     esac
@@ -1697,8 +1823,8 @@ configure_exit() {
 
   print_block "🛡️ 节点防指纹伪装模板选择"
   echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 企业级动态交互版)"
-  echo "2) ⚙️ API 调试文档 (Swagger UI - 掩护高频 WebSocket)"
-  echo "3) 🗄️ 对象存储控制台 (MinIO 风格 - 掩护大带宽流媒体)"
+  echo "2) ⚙️ API 调试文档 (Swagger UI - 含异步 JSON 回显)"
+  echo "3) 🗄️ 对象存储控制台 (MinIO - 含动态状态流转)"
   echo "4) 🌐 极简欢迎页 (Nginx 默认 - 绝对纯净无代码)"
   echo "5) 📈 数据大屏面板 (Grafana 风格 - 掩护高频心跳)"
   echo "6) 🎥 安防视频网关 (WebRTC 风格 - 掩护大带宽/UDP)"
@@ -2041,8 +2167,8 @@ while true; do
   echo "7) 卸载并清理"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
-  echo "10) 修改出口 IP / 域名（仅入口）"
-  echo "11) 证书管理（仅出口）"
+  echo "10) 修改出口 IP / 域名（仅入口使用）"
+  echo "11) 出口高级管理 (证书 / 域名切换 / 伪装库)"
   echo "0) 退出"
   echo "====================================================================="
   read -rp "请选择: " choice
@@ -2058,7 +2184,7 @@ while true; do
     8) manage_entry_ports ;;
     9) manage_entry_mode ;;
     10) update_wstunnel_entry_remote_ip ;;
-    11) manage_certificates ;;
+    11) manage_exit_node ;;
     0) exit 0 ;;
     *) print_err "无效选择" ;;
   esac
