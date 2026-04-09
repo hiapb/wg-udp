@@ -252,6 +252,7 @@ write_nginx_https_wstunnel_site() {
 
   case "$template_id" in
     1)
+      # 模板 1：虚拟桌面网关 (Nexus VDI - 企业级动态交互版)
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -456,6 +457,7 @@ write_nginx_https_wstunnel_site() {
 EOF
       ;;
     2)
+      # 模板 2：API 调试文档 (Swagger UI - 含异步 JSON 回显)
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -537,13 +539,11 @@ EOF
     respArea.style.display = 'none';
     respArea.innerText = '';
 
-    // 模拟真实的网络延迟与执行特征图
     setTimeout(() => {
       btn.disabled = false;
       loader.style.display = 'none';
       respArea.style.display = 'block';
       
-      // 逐字打印效果，增加 DOM 操作复杂度骗过特征检测
       let i = 0;
       respArea.innerText = "HTTP/1.1 401 Unauthorized\nContent-Type: application/json\n\n";
       const interval = setInterval(() => {
@@ -560,7 +560,7 @@ EOF
 EOF
       ;;
     3)
-      # 模板 3：高仿真对象存储控制台 (MinIO 风格 - 模拟 React 状态流转与网络超时)
+      # 模板 3：对象存储控制台 (MinIO - 含动态状态流转)
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html lang="en">
@@ -608,7 +608,7 @@ EOF
     <span id="btnTxt">Sign In</span>
   </button>
   
-  <div class="footer-text">S3 Compatible API Endpoint Active v.RELEASE.2026-03-01</div>
+  <div class="footer-text">S3 Compatible API Endpoint Active v.RELEASE.2026</div>
 </div>
 
 <script>
@@ -631,7 +631,6 @@ EOF
     spn.style.display = 'block';
     txt.innerText = 'Authenticating...';
 
-    // 模拟服务端验证耗时与高密度 DOM 状态流转
     setTimeout(() => {
       btn.disabled = false;
       spn.style.display = 'none';
@@ -647,7 +646,7 @@ EOF
 EOF
       ;;
     4)
-      # 模板 4：Nginx 极简欢迎页 (无主之地 - 绝对纯净静态，无 JS，彻底隐身于互联网的本底噪声中)
+      # 模板 4：极简欢迎页 (Nginx 默认 - 绝对纯净无代码)
       cat > "$web_root/index.html" <<'EOF'
 <!DOCTYPE html>
 <html>
@@ -663,6 +662,341 @@ EOF
 <p>For online documentation and support please refer to <a href="http://nginx.org/">nginx.org</a>.<br/>
 Commercial support is available at <a href="http://nginx.com/">nginx.com</a>.</p>
 <p><em>Thank you for using nginx.</em></p>
+</body>
+</html>
+EOF
+      ;;
+    5)
+      # 模板 5：数据大屏面板 (Grafana 风格 - 掩护高频心跳)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Metrics Observability Platform</title>
+<style>
+  body { background-color: #111217; color: #d8d9da; font-family: Roboto, Helvetica, Arial, sans-serif; display: flex; justify-content: center; align-items: center; height: 100vh; margin: 0;}
+  .panel { background: #181b1f; border: 1px solid #202226; width: 400px; padding: 40px; border-radius: 4px; box-shadow: 0 4px 10px rgba(0,0,0,0.3);}
+  .logo { text-align: center; margin-bottom: 30px; font-size: 28px; font-weight: bold; color: #f47a20; display: flex; justify-content: center; align-items: center; gap: 10px;}
+  .input-field { width: 100%; background: #0b0c0e; border: 1px solid #202226; color: #c7c8c9; padding: 12px; margin-bottom: 20px; box-sizing: border-box; border-radius: 2px;}
+  .input-field:focus { outline: none; border-color: #f47a20;}
+  .btn-login { width: 100%; background: #f47a20; color: #fff; padding: 12px; border: none; font-weight: bold; cursor: pointer; border-radius: 2px; font-size: 16px; transition: background 0.2s;}
+  .btn-login:hover { background: #e06912;}
+  .alert { background: #e02f44; color: white; padding: 10px; margin-bottom: 20px; border-radius: 2px; font-size: 14px; display: none; border-left: 4px solid #ad1c2c;}
+</style>
+</head>
+<body>
+<div class="panel">
+  <div class="logo">
+    <svg width="32" height="32" viewBox="0 0 100 100" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><circle cx="50" cy="50" r="40" stroke="currentColor" stroke-width="15" fill="none"/><circle cx="50" cy="50" r="15"/></svg>
+    Observability UI
+  </div>
+  <div class="alert" id="msgBox"></div>
+  <input type="text" class="input-field" id="usr" placeholder="Email or username">
+  <input type="password" class="input-field" id="pwd" placeholder="Password">
+  <button class="btn-login" id="lBtn" onclick="doLogin()">Log In</button>
+</div>
+<script>
+  function doLogin() {
+    if(!document.getElementById('usr').value) return;
+    const btn = document.getElementById('lBtn');
+    const msg = document.getElementById('msgBox');
+    btn.innerText = "Connecting to TSDB...";
+    btn.disabled = true;
+    msg.style.display = 'none';
+    
+    setTimeout(() => {
+      msg.innerText = "Auth Timeout: Connection to Prometheus/InfluxDB backend failed. Please check network connectivity.";
+      msg.style.display = 'block';
+      btn.innerText = "Log In";
+      btn.disabled = false;
+    }, 1800);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    6)
+      # 模板 6：安防视频网关 (WebRTC 风格 - 掩护大带宽/UDP)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>NVR Video Gateway</title>
+<style>
+  body { background: #000; color: #fff; font-family: monospace; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0; overflow: hidden;}
+  .viewport { width: 800px; height: 450px; border: 2px solid #333; position: relative; background: #111; display: flex; justify-content: center; align-items: center; flex-direction: column; box-shadow: 0 0 20px rgba(0,0,0,0.8);}
+  .overlay { position: absolute; top: 10px; left: 10px; color: #0f0; font-size: 12px; text-shadow: 1px 1px 0 #000;}
+  .overlay.right { left: auto; right: 10px; text-align: right;}
+  .btn-start { padding: 15px 30px; background: rgba(0,255,0,0.2); border: 1px solid #0f0; color: #0f0; font-family: monospace; cursor: pointer; text-transform: uppercase; letter-spacing: 2px; transition: all 0.3s;}
+  .btn-start:hover { background: rgba(0,255,0,0.5);}
+  .btn-start:disabled { border-color: #555; color: #555; background: none; cursor: not-allowed;}
+  .console { width: 800px; background: #0a0a0a; color: #ccc; font-size: 11px; padding: 10px; box-sizing: border-box; border: 1px solid #222; border-top: none; height: 150px; overflow-y: auto;}
+  .err-text { color: #f00; font-weight: bold;}
+</style>
+</head>
+<body>
+<div class="viewport">
+  <div class="overlay" id="time">CAM-01 [NVR-MASTER]</div>
+  <div class="overlay right">STREAM: WebRTC/UDP<br>BITRATE: -- kbps</div>
+  <button class="btn-start" id="initBtn" onclick="startStream()">Initialize Stream</button>
+</div>
+<div class="console" id="log"></div>
+<script>
+  setInterval(() => { document.getElementById('time').innerText = "CAM-01 [NVR-MASTER] " + new Date().toISOString(); }, 1000);
+  const log = document.getElementById('log');
+  function addLog(msg, isErr=false) {
+    const d = document.createElement('div');
+    d.innerHTML = `[${new Date().toISOString().split('T')[1].substring(0,8)}] ${isErr ? '<span class="err-text">'+msg+'</span>' : msg}`;
+    log.appendChild(d);
+    log.scrollTop = log.scrollHeight;
+  }
+  function startStream() {
+    document.getElementById('initBtn').disabled = true;
+    addLog("Negotiating with NVR edge node...");
+    setTimeout(() => {
+      addLog("Signaling state: have-local-offer");
+      addLog("Gathering ICE candidates (UDP/TURN)...");
+      setTimeout(() => {
+        addLog("ICE state: checking");
+        setTimeout(() => {
+          addLog("Stream established. Probing video track...");
+          setTimeout(() => {
+            addLog("FATAL ERROR: H.265 (HEVC) Codec missing in client browser.", true);
+            addLog("Video pipeline terminated.", true);
+            document.getElementById('initBtn').innerText = "STREAM OFFLINE";
+          }, 800);
+        }, 1200);
+      }, 1000);
+    }, 500);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    7)
+      # 模板 7：Web 终端堡垒机 (WebSSH 风格 - 掩护长连接交互)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<title>Terminal Access</title>
+<style>
+  body { background: #000; color: #0f0; font-family: "Courier New", Courier, monospace; margin: 0; padding: 20px; font-size: 15px;}
+  .input-line { display: flex; }
+  .prompt { margin-right: 8px; }
+  input { background: transparent; border: none; color: #0f0; font-family: inherit; font-size: inherit; flex-grow: 1; outline: none;}
+</style>
+</head>
+<body>
+<div id="terminal">
+  <div>Nexus Enterprise Bastion Host v4.2</div>
+  <div>Authorized personnel only. All activity is logged.</div><br>
+  <div class="input-line" id="userLine"><span class="prompt">bastion-login:</span><input type="text" id="usr" autofocus autocomplete="off"></div>
+</div>
+<script>
+  const usr = document.getElementById('usr');
+  const term = document.getElementById('terminal');
+  usr.addEventListener('keypress', function(e) {
+    if(e.key === 'Enter' && usr.value.trim() !== '') {
+      usr.disabled = true;
+      const pwdDiv = document.createElement('div');
+      pwdDiv.className = 'input-line';
+      pwdDiv.innerHTML = `<span class="prompt">Password:</span><input type="password" id="pwd" autocomplete="off">`;
+      term.appendChild(pwdDiv);
+      const pwd = document.getElementById('pwd');
+      pwd.focus();
+      pwd.addEventListener('keypress', function(ev) {
+        if(ev.key === 'Enter') {
+          pwd.disabled = true;
+          setTimeout(() => {
+            const err = document.createElement('div');
+            err.innerText = "Permission denied (publickey,keyboard-interactive).";
+            term.appendChild(err);
+            const disc = document.createElement('div');
+            disc.innerText = "Connection closed by remote host.";
+            term.appendChild(disc);
+          }, 600);
+        }
+      });
+    }
+  });
+</script>
+</body>
+</html>
+EOF
+      ;;
+    8)
+      # 模板 8：企业私有云盘 (ownCloud 风格 - 掩护突发双向大流量)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cloud Enterprise Storage</title>
+<style>
+  body { background: #1d2b36; color: #fff; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh; margin: 0;}
+  .login-box { background: #fff; padding: 40px 30px; border-radius: 5px; width: 300px; text-align: center; box-shadow: 0 5px 15px rgba(0,0,0,0.5);}
+  h1 { color: #1d2b36; margin: 0 0 30px 0; font-weight: 300;}
+  input { width: 100%; padding: 10px; margin-bottom: 15px; border: 1px solid #ccc; border-radius: 3px; box-sizing: border-box; font-size: 14px;}
+  input:focus { outline: none; border-color: #0082c9;}
+  button { width: 100%; background: #0082c9; color: #fff; border: none; padding: 12px; font-size: 16px; border-radius: 3px; cursor: pointer;}
+  button:hover { background: #006da8;}
+  .err { color: #e9322d; margin-top: 15px; font-size: 13px; display: none;}
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1>Cloud <b>Storage</b></h1>
+  <input type="text" id="usr" placeholder="Username or email">
+  <input type="password" id="pwd" placeholder="Password">
+  <button onclick="login()" id="lbtn">Log in</button>
+  <div class="err" id="errMsg"></div>
+</div>
+<script>
+  function login() {
+    const btn = document.getElementById('lbtn');
+    const err = document.getElementById('errMsg');
+    if(!document.getElementById('usr').value) return;
+    btn.innerText = "Syncing policies...";
+    btn.disabled = true;
+    err.style.display = 'none';
+    setTimeout(() => {
+      err.innerText = "WebDAV Error: Storage backend cluster is currently offline for maintenance.";
+      err.style.display = 'block';
+      btn.innerText = "Log in";
+      btn.disabled = false;
+    }, 1500);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    9)
+      # 模板 9：自动化流水线 (CI/CD 风格 - 掩护大突发+实时日志流)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pipeline Console - GitLab CI</title>
+<style>
+  body { font-family: -apple-system, system-ui; margin: 0; background: #fbfafd; color: #333;}
+  .header { background: #292961; color: #fff; padding: 15px 20px; font-weight: bold; font-size: 18px; display: flex; justify-content: space-between; align-items: center;}
+  .content { padding: 20px; max-width: 1000px; margin: 0 auto;}
+  .info-bar { background: #fff; border: 1px solid #e5e5e5; padding: 15px; border-radius: 4px; margin-bottom: 20px; display: flex; justify-content: space-between; align-items: center;}
+  .btn-run { background: #1068bf; color: #fff; border: none; padding: 8px 16px; border-radius: 4px; font-weight: bold; cursor: pointer;}
+  .btn-run:disabled { background: #a6a6a6; cursor: not-allowed;}
+  .terminal { background: #1f1e24; color: #ececec; font-family: monospace; padding: 15px; border-radius: 4px; height: 400px; overflow-y: auto; font-size: 13px; line-height: 1.5;}
+  .cmd { color: #50fa7b; }
+  .err { color: #ff5555; }
+</style>
+</head>
+<body>
+<div class="header"><div>Pipeline #89420</div><div>Project: core-services/api-gateway</div></div>
+<div class="content">
+  <div class="info-bar">
+    <div><b>Status:</b> <span style="color:#707070" id="status">Pending</span> | <b>Branch:</b> main</div>
+    <button class="btn-run" id="rBtn" onclick="runJob()">Retry Job</button>
+  </div>
+  <div class="terminal" id="term">$ Waiting for runner to pick up job...<br></div>
+</div>
+<script>
+  const logs = [
+    "<span class='cmd'>$ git clone https://git.internal.loc/core/api-gateway.git</span>",
+    "Cloning into 'api-gateway'...",
+    "Checking out 9a2f1b4... done.",
+    "<span class='cmd'>$ docker build -t registry.internal.loc/api-gateway:latest .</span>",
+    "Step 1/12 : FROM node:18-alpine AS builder",
+    " ---> 9a475d4a1921",
+    "Step 2/12 : WORKDIR /app",
+    " ---> Running in 3b2d1f9a8",
+    "Step 3/12 : COPY package*.json ./",
+    " ---> 7f3a2c1b9",
+    "<span class='cmd'>$ npm ci --only=production</span>",
+    "npm WARN deprecated request@2.88.2: request has been deprecated",
+    "added 452 packages in 12.4s",
+    "<span class='cmd'>$ npm run build</span>",
+    "> api-gateway@3.0.0 build /app",
+    "> tsc",
+    "<span class='err'>src/auth/jwt.ts(45,22): error TS2339: Property 'verify' does not exist on type 'typeof import(\"jsonwebtoken\")'.</span>",
+    "<span class='err'>src/routes/api.ts(12,5): error TS2322: Type 'string' is not assignable to type 'number'.</span>",
+    "<span class='err'>npm ERR! code ELIFECYCLE</span>",
+    "<span class='err'>npm ERR! errno 2</span>",
+    "<span class='err'>ERROR: Job failed: exit code 1</span>"
+  ];
+  function runJob() {
+    const btn = document.getElementById('rBtn');
+    const term = document.getElementById('term');
+    const stat = document.getElementById('status');
+    btn.disabled = true;
+    stat.innerText = "Running";
+    stat.style.color = "#1068bf";
+    term.innerHTML = "$ Running with gitlab-runner 16.1.0<br>";
+    
+    let i = 0;
+    const interval = setInterval(() => {
+      term.innerHTML += logs[i] + "<br>";
+      term.scrollTop = term.scrollHeight;
+      i++;
+      if(i >= logs.length) {
+        clearInterval(interval);
+        stat.innerText = "Failed";
+        stat.style.color = "#ff5555";
+        btn.disabled = false;
+      }
+    }, 400);
+  }
+</script>
+</body>
+</html>
+EOF
+      ;;
+    10)
+      # 模板 10：智能家居中枢 (Home Assistant 风格 - 掩护全天候活跃)
+      cat > "$web_root/index.html" <<'EOF'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Home Assistant</title>
+<style>
+  body { background: #fafafa; color: #212121; font-family: Roboto, sans-serif; margin: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100vh;}
+  .top-bar { position: absolute; top: 0; width: 100%; height: 56px; background: #03a9f4; box-shadow: 0 2px 4px rgba(0,0,0,0.2);}
+  .card { background: #fff; width: 340px; padding: 30px; border-radius: 4px; box-shadow: 0 2px 2px 0 rgba(0,0,0,0.14), 0 3px 1px -2px rgba(0,0,0,0.12), 0 1px 5px 0 rgba(0,0,0,0.2); text-align: center;}
+  .logo { background: #03a9f4; width: 80px; height: 80px; border-radius: 50%; margin: 0 auto 20px auto; display: flex; justify-content: center; align-items: center; color: white; font-size: 36px;}
+  h2 { margin: 0 0 10px 0; font-weight: 400;}
+  p { color: #757575; font-size: 14px; line-height: 1.5; margin-bottom: 25px;}
+  .loader { border: 3px solid #f3f3f3; border-top: 3px solid #03a9f4; border-radius: 50%; width: 24px; height: 24px; animation: spin 1s linear infinite; margin: 0 auto 15px auto;}
+  @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+  .err { color: #d32f2f; font-size: 14px; display: none;}
+</style>
+</head>
+<body>
+<div class="top-bar"></div>
+<div class="card">
+  <div class="logo">⌂</div>
+  <h2>Home Assistant</h2>
+  <p>Initializing connection to local Home Gateway...</p>
+  <div class="loader" id="ldr"></div>
+  <div class="err" id="errMsg">Unable to connect to MQTT Broker. Retrying...</div>
+</div>
+<script>
+  setTimeout(() => {
+    document.getElementById('ldr').style.display = 'none';
+    document.getElementById('errMsg').style.display = 'block';
+  }, 3000);
+</script>
 </body>
 </html>
 EOF
@@ -1363,12 +1697,18 @@ configure_exit() {
 
   print_block "🛡️ 节点防指纹伪装模板选择"
   echo "1) 🏢 虚拟桌面网关 (Nexus VDI - 企业级动态交互版)"
-  echo "2) ⚙️ API 调试文档 (Swagger UI - 含异步 JSON 回显)"
-  echo "3) 🗄️ 对象存储控制台 (MinIO - 含动态状态流转)"
+  echo "2) ⚙️ API 调试文档 (Swagger UI - 掩护高频 WebSocket)"
+  echo "3) 🗄️ 对象存储控制台 (MinIO 风格 - 掩护大带宽流媒体)"
   echo "4) 🌐 极简欢迎页 (Nginx 默认 - 绝对纯净无代码)"
+  echo "5) 📈 数据大屏面板 (Grafana 风格 - 掩护高频心跳)"
+  echo "6) 🎥 安防视频网关 (WebRTC 风格 - 掩护大带宽/UDP)"
+  echo "7) 💻 Web 终端堡垒机 (WebSSH 风格 - 掩护长连接交互)"
+  echo "8) ☁️ 企业私有云盘 (ownCloud 风格 - 掩护突发双向大流量)"
+  echo "9) 🚀 自动化流水线 (CI/CD 风格 - 掩护大突发+实时日志流)"
+  echo "10) 🏠 智能家居中枢 (Home Assistant 风格 - 掩护全天候活跃)"
   local template_id=""
-  while [[ ! "$template_id" =~ ^[1-4]$ ]]; do
-    read -rp "请选择伪装策略 [1-4] (默认 1): " template_id
+  while [[ ! "$template_id" =~ ^([1-9]|10)$ ]]; do
+    read -rp "请选择伪装策略 [1-10] (默认 1): " template_id
     template_id="${template_id:-1}"
   done
 
