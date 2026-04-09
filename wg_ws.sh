@@ -214,16 +214,21 @@ server {
 EOF
 
   ln -sf "$site_file" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
-  nginx -t >/dev/null
+  nginx -t >/dev/null || true
   systemctl restart nginx
   echo "$site_file" > "$WST_NGINX_SITE_FILE"
 }
 
+# 【改动1：改造证书申请函数，增加状态返回，而非报错直接退出】
 issue_letsencrypt_cert() {
   local domain="$1"
   print_step "证书" "正在申请 HTTPS 证书: ${domain}"
-  certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect >/dev/null 2>&1
-  print_ok "HTTPS 证书申请完成: ${domain}"
+  if certbot --nginx -d "$domain" --non-interactive --agree-tos -m "admin@${domain}" --redirect >/dev/null 2>&1; then
+    print_ok "HTTPS 证书申请成功: ${domain}"
+    return 0
+  else
+    return 1
+  fi
 }
 
 write_nginx_https_wstunnel_site() {
@@ -478,7 +483,6 @@ server {
     listen ${https_port} ssl;
     server_name ${domain};
 
-    # 【改动1：抹除 Nginx 访问与错误日志】
     access_log off;
     error_log /dev/null crit;
 
@@ -551,7 +555,6 @@ Restart=on-failure
 RestartSec=2
 User=root
 LimitNOFILE=1048576
-# 【改动2：强制丢弃 wstunnel 的标准输出，切断 Journald 日志注入】
 StandardOutput=null
 StandardError=journal
 
@@ -595,7 +598,6 @@ Restart=on-failure
 RestartSec=2
 User=root
 LimitNOFILE=1048576
-# 【改动2：强制丢弃 wstunnel 的标准输出，切断 Journald 日志注入】
 StandardOutput=null
 StandardError=journal
 
@@ -1120,12 +1122,29 @@ configure_exit() {
   print_block "【本机（出口服务器）公钥】"
   echo "$exit_public_key"
 
+  # 【改动2：增加防退出闭环，失败则清理脏配置并重新要求输入】
   local domain=""
-  while [[ -z "$domain" ]]; do
+  while true; do
     read -rp "出口服务器绑定域名（必须已解析到本机）: " domain
-    [[ -z "$domain" ]] && print_err "域名不能为空"
+    if [[ -z "$domain" ]]; then
+      print_err "域名不能为空"
+      continue
+    fi
+
+    print_step "站点" "写入 HTTP 验证站点配置..."
+    write_nginx_http_site_for_acme "$domain"
+
+    if issue_letsencrypt_cert "$domain"; then
+      echo "$domain" > "$WST_DOMAIN_FILE"
+      break
+    else
+      print_err "HTTPS 证书申请失败，请检查 DNS 解析是否生效，或输入是否拼写错误！"
+      print_warn "正在自动清理刚才生成的无效 Nginx 配置文件..."
+      rm -f "${NGINX_SITE_DIR}/${domain}.conf" "${NGINX_SITE_ENABLED_DIR}/${domain}.conf"
+      systemctl reload nginx >/dev/null 2>&1 || true
+      domain="" # 清空变量，强制进入下一次循环
+    fi
   done
-  echo "$domain" > "$WST_DOMAIN_FILE"
 
   local wg_addr entry_wg_ip out_if ws_port wg_udp_port backend_port path_prefix default_if
   read -rp "出口服务器 WireGuard 内网 IP (默认 10.0.0.1/24): " wg_addr
@@ -1148,10 +1167,6 @@ configure_exit() {
   local recommended_path="ws_$(rand_hex16 || echo "a1b2c3d4e5f67890")"
   read -rp "WebSocket 路径前缀/密钥 (默认 ${recommended_path}): " path_prefix
   path_prefix="$(normalize_path_prefix "${path_prefix:-${recommended_path}}")"
-
-  print_step "站点" "写入 HTTP 验证站点配置..."
-  write_nginx_http_site_for_acme "$domain"
-  issue_letsencrypt_cert "$domain"
 
   print_step "站点" "写入 HTTPS + wstunnel 反代配置..."
   write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix" "$ws_port"
