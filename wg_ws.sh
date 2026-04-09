@@ -478,6 +478,10 @@ server {
     listen ${https_port} ssl;
     server_name ${domain};
 
+    # 【改动1：抹除 Nginx 访问与错误日志】
+    access_log off;
+    error_log /dev/null crit;
+
     ssl_certificate /etc/letsencrypt/live/${domain}/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/${domain}/privkey.pem;
     ssl_session_timeout 1d;
@@ -547,6 +551,9 @@ Restart=on-failure
 RestartSec=2
 User=root
 LimitNOFILE=1048576
+# 【改动2：强制丢弃 wstunnel 的标准输出，切断 Journald 日志注入】
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
@@ -588,6 +595,9 @@ Restart=on-failure
 RestartSec=2
 User=root
 LimitNOFILE=1048576
+# 【改动2：强制丢弃 wstunnel 的标准输出，切断 Journald 日志注入】
+StandardOutput=null
+StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
