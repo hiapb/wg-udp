@@ -67,10 +67,11 @@ set_mode_flag() {
 }
 
 install_base_packages() {
-  print_step "1/2" "安装基础依赖..."
+  print_step "1/2" "安装基础依赖与环境..."
   export DEBIAN_FRONTEND=noninteractive
   apt update -y >/dev/null 2>&1 || true
-  apt install -y curl tar ca-certificates iproute2 iptables golang-go >/dev/null 2>&1
+  # 强制补全所有底层缺失依赖 (包括 go 编译所需的 git，以及生成随机数的 coreutils)
+  apt install -y curl tar ca-certificates iproute2 iptables golang-go git openssl coreutils >/dev/null 2>&1
   
   cat << 'EOF' > /etc/sysctl.d/99-nexus.conf
 net.core.default_qdisc=fq
@@ -364,9 +365,14 @@ configure_exit() {
   install_base_packages
   install_core_engine
 
-  read -rp "监听密文端口 (推荐 443): " l_port
+  read -rp "监听密文端口 (推荐 443 伪装效果最佳): " l_port
   l_port="${l_port:-443}"
-  read -rp "隧道加密密钥: " s_key
+  
+  # 每次部署动态生成绝对随机的强特征密钥
+  local rand_key
+  rand_key=$(head -c 32 /dev/urandom | sha256sum | head -c 32)
+  read -rp "隧道加密密钥 (默认生成: ${rand_key}): " s_key
+  s_key="${s_key:-$rand_key}"
 
   cat << EOF > $SVC_PATH
 [Unit]
@@ -385,7 +391,7 @@ EOF
   
   print_block "✅ 出口配置完成"
   echo "监听端口: ${l_port}"
-  echo "加密密钥: ${s_key}"
+  echo "加密密钥: ${s_key} (请复制此密钥在入口端使用)"
 }
 
 configure_entry() {
@@ -397,7 +403,11 @@ configure_entry() {
   read -rp "出口服务器 IP / 域名: " r_host
   read -rp "出口服务器密文端口 (默认 443): " r_port
   r_port="${r_port:-443}"
-  read -rp "隧道加密密钥: " s_key
+  
+  local s_key=""
+  while [[ -z "$s_key" ]]; do
+    read -rp "隧道加密密钥 (需填入出口服务器生成的密钥): " s_key
+  done
 
   cat << EOF > $SVC_PATH
 [Unit]
@@ -457,13 +467,25 @@ restart_wg() {
 
 uninstall_wg() {
   print_block "⏳ 开始彻底卸载并清理"
+  # 停止并删除服务
   systemctl stop darknexus.service 2>/dev/null || true
   systemctl disable darknexus.service 2>/dev/null || true
+  rm -f "$SVC_PATH"
+  
+  # 清理 iptables 链
   clear_mark_rules
-  rm -f "$BIN_PATH" "$SVC_PATH" "$SRC_PATH"
+  
+  # 逆向清理系统内核配置
+  rm -f /etc/sysctl.d/99-nexus.conf
+  sysctl --system >/dev/null 2>&1 || true
+  
+  # 拔除所有文件与编译残留
+  rm -f "$BIN_PATH"
   rm -rf "$NEXUS_DIR"
+  rm -rf /usr/local/src/darknexus*
+  
   systemctl daemon-reload
-  print_ok "✅ 已彻底清理完成"
+  print_ok "✅ 已彻底清理完成 (服务、配置、内核参数及所有残留文件已销毁)"
 }
 
 manage_entry_ports() {
@@ -573,7 +595,7 @@ while true; do
   echo "7) 卸载并清理"
   echo "8) 管理入口端口分流"
   echo "9) 管理入口模式（全局 / 分流）"
-  echo "10) 修改出口 IP / 域名（仅入口使用）"
+  echo "10) 修改出口 IP / 端口（仅入口使用）"
   echo "0) 退出"
   echo "====================================================================="
   read -rp "请选择: " choice
