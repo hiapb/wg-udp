@@ -27,7 +27,7 @@ get_current_mode() { [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" 2>/dev/null || ec
 set_mode_flag() { echo "$1" > "$MODE_FILE"; }
 
 install_base_deps_only() {
-  print_step "1/2" "仅安装基础依赖 (跳过系统内核调优)..."
+  print_step "1/2" "安装基础依赖..."
   export DEBIAN_FRONTEND=noninteractive
   apt update -y >/dev/null 2>&1 || true
   apt install -y curl tar ca-certificates iproute2 iptables golang-go coreutils >/dev/null 2>&1
