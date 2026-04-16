@@ -15,62 +15,31 @@ if [[ $EUID -ne 0 ]]; then
   exit 1
 fi
 
-print_block() {
-  local title="$1"
-  echo
-  echo "=================================================="
-  echo "$title"
-  echo "=================================================="
-}
+print_block() { echo; echo "=================================================="; echo "$1"; echo "=================================================="; }
+print_step() { echo "[$1] $2"; }
+print_ok() { echo "✅ $1"; }
+print_warn() { echo "⚠️  $1"; }
+print_err() { echo "❌ $1"; }
 
-print_step() {
-  local step="$1"
-  local text="$2"
-  echo "[$step] $text"
-}
+get_role() { [[ -f "$ROLE_FILE" ]] && cat "$ROLE_FILE" 2>/dev/null || echo "unknown"; }
+set_role() { mkdir -p "$(dirname "$ROLE_FILE")"; echo "$1" > "$ROLE_FILE"; }
+get_current_mode() { [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" 2>/dev/null || echo "split"; }
+set_mode_flag() { echo "$1" > "$MODE_FILE"; }
 
-print_ok() {
-  echo "✅ $1"
-}
-
-print_warn() {
-  echo "⚠️  $1"
-}
-
-print_err() {
-  echo "❌ $1"
-}
-
-get_role() {
-  if [[ -f "$ROLE_FILE" ]]; then
-    cat "$ROLE_FILE" 2>/dev/null || echo "unknown"
-  else
-    echo "unknown"
-  fi
-}
-
-set_role() {
-  mkdir -p "$(dirname "$ROLE_FILE")"
-  echo "$1" > "$ROLE_FILE"
-}
-
-get_current_mode() {
-  if [[ -f "$MODE_FILE" ]]; then
-    cat "$MODE_FILE" 2>/dev/null || echo "split"
-  else
-    echo "split"
-  fi
-}
-
-set_mode_flag() {
-  echo "$1" > "$MODE_FILE"
-}
-
-install_base_packages() {
-  print_step "1/2" "安装基础依赖与环境..."
+# 剥离：仅针对出口的纯净依赖安装（绝不触碰内核参数）
+install_base_deps_only() {
+  print_step "1/2" "仅安装基础依赖 (跳过系统内核调优)..."
   export DEBIAN_FRONTEND=noninteractive
   apt update -y >/dev/null 2>&1 || true
-  # 强制补全所有底层缺失依赖 (包括 go 编译所需的 git，以及生成随机数的 coreutils)
+  apt install -y curl tar ca-certificates iproute2 iptables golang-go git openssl coreutils >/dev/null 2>&1
+  print_ok "基础依赖安装完成，已完整保留您的自定义内核配置"
+}
+
+# 剥离：针对入口的激进调优与依赖安装
+install_deps_and_tune() {
+  print_step "1/2" "安装基础依赖并执行入口内核并发调优..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt update -y >/dev/null 2>&1 || true
   apt install -y curl tar ca-certificates iproute2 iptables golang-go git openssl coreutils >/dev/null 2>&1
   
   cat << 'EOF' > /etc/sysctl.d/99-nexus.conf
@@ -85,7 +54,7 @@ net.core.netdev_max_backlog=250000
 net.ipv4.ip_forward=1
 EOF
   sysctl -p /etc/sysctl.d/99-nexus.conf >/dev/null 2>&1 || true
-  print_ok "基础依赖与内核参数配置完成"
+  print_ok "基础依赖与入口内核参数配置完成"
 }
 
 install_core_engine() {
@@ -102,11 +71,12 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"math/rand/v2"
+	mathrand "math/rand"
 	"net"
 	"strconv"
 	"sync"
 	"syscall"
+	"time"
 	"golang.org/x/crypto/chacha20poly1305"
 )
 
@@ -116,6 +86,10 @@ var (
 	bufPool     = sync.Pool{New: func() interface{} { return make([]byte, 32768) }}
 	payloadPool = sync.Pool{New: func() interface{} { return make([]byte, 65536) }}
 )
+
+func init() {
+	mathrand.Seed(time.Now().UnixNano())
+}
 
 func main() {
 	isServer := flag.Bool("s", false, "")
@@ -160,13 +134,13 @@ func writeObfs(dst net.Conn, pt []byte, aead cipher.AEAD) error {
 	padLen := 0
 
 	if dataLen == 0 {
-		padLen = 256 + rand.IntN(512)
+		padLen = 256 + mathrand.Intn(512)
 	} else if dataLen < 256 {
-		padLen = 512 - dataLen + rand.IntN(64)
+		padLen = 512 - dataLen + mathrand.Intn(64)
 	} else if dataLen < 1000 {
 		padLen = 1350 - dataLen
 	} else {
-		padLen = rand.IntN(32)
+		padLen = mathrand.Intn(32)
 	}
 
 	payload := payloadPool.Get().([]byte)[: 2+dataLen+padLen ]
@@ -301,9 +275,18 @@ func decodeAndWrite(src net.Conn, dst net.Conn, aead cipher.AEAD) {
 }
 EOF
   cd /usr/local/src
-  go mod init darknexus >/dev/null 2>&1
-  go get golang.org/x/crypto/chacha20poly1305 >/dev/null 2>&1
-  go build -o $BIN_PATH darknexus.go
+  
+  if ! go mod init darknexus >/dev/null 2>&1; then true; fi
+  if ! go get golang.org/x/crypto/chacha20poly1305 >/dev/null 2>&1; then
+      print_err "依赖拉取失败，请检查网络连通性或 DNS。"
+      exit 1
+  fi
+  
+  if ! go build -o $BIN_PATH darknexus.go; then
+      print_err "编译失败！系统环境或 Golang 版本存在异常。"
+      exit 1
+  fi
+  
   print_ok "核心引擎编译完成"
 }
 
@@ -362,13 +345,14 @@ enable_global_mode() {
 configure_exit() {
   set_role "exit"
   print_block "⏳ 开始配置出口服务器"
-  install_base_packages
+  
+  # 调用无内核修改的纯净依赖安装
+  install_base_deps_only
   install_core_engine
 
   read -rp "监听密文端口 (推荐 443 伪装效果最佳): " l_port
   l_port="${l_port:-443}"
   
-  # 每次部署动态生成绝对随机的强特征密钥
   local rand_key
   rand_key=$(head -c 32 /dev/urandom | sha256sum | head -c 32)
   read -rp "隧道加密密钥 (默认生成: ${rand_key}): " s_key
@@ -397,7 +381,9 @@ EOF
 configure_entry() {
   set_role "entry"
   print_block "⏳ 开始配置入口服务器"
-  install_base_packages
+  
+  # 调用包含系统调优的入口依赖安装
+  install_deps_and_tune
   install_core_engine
 
   read -rp "出口服务器 IP / 域名: " r_host
@@ -467,25 +453,24 @@ restart_wg() {
 
 uninstall_wg() {
   print_block "⏳ 开始彻底卸载并清理"
-  # 停止并删除服务
   systemctl stop darknexus.service 2>/dev/null || true
   systemctl disable darknexus.service 2>/dev/null || true
   rm -f "$SVC_PATH"
   
-  # 清理 iptables 链
   clear_mark_rules
   
-  # 逆向清理系统内核配置
-  rm -f /etc/sysctl.d/99-nexus.conf
-  sysctl --system >/dev/null 2>&1 || true
+  # 仅在发现内核调整文件存在时，才执行逆向清理
+  if [[ -f /etc/sysctl.d/99-nexus.conf ]]; then
+      rm -f /etc/sysctl.d/99-nexus.conf
+      sysctl --system >/dev/null 2>&1 || true
+  fi
   
-  # 拔除所有文件与编译残留
   rm -f "$BIN_PATH"
   rm -rf "$NEXUS_DIR"
   rm -rf /usr/local/src/darknexus*
   
   systemctl daemon-reload
-  print_ok "✅ 已彻底清理完成 (服务、配置、内核参数及所有残留文件已销毁)"
+  print_ok "✅ 已彻底清理完成 (服务、配置及所有残留文件已销毁)"
 }
 
 manage_entry_ports() {
