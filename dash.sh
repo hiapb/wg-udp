@@ -26,21 +26,19 @@ set_role() { mkdir -p "$(dirname "$ROLE_FILE")"; echo "$1" > "$ROLE_FILE"; }
 get_current_mode() { [[ -f "$MODE_FILE" ]] && cat "$MODE_FILE" 2>/dev/null || echo "split"; }
 set_mode_flag() { echo "$1" > "$MODE_FILE"; }
 
-# 剥离：仅针对出口的纯净依赖安装（绝不触碰内核参数）
 install_base_deps_only() {
   print_step "1/2" "仅安装基础依赖 (跳过系统内核调优)..."
   export DEBIAN_FRONTEND=noninteractive
   apt update -y >/dev/null 2>&1 || true
-  apt install -y curl tar ca-certificates iproute2 iptables golang-go git openssl coreutils >/dev/null 2>&1
+  apt install -y curl tar ca-certificates iproute2 iptables golang-go coreutils >/dev/null 2>&1
   print_ok "基础依赖安装完成，已完整保留您的自定义内核配置"
 }
 
-# 剥离：针对入口的激进调优与依赖安装
 install_deps_and_tune() {
   print_step "1/2" "安装基础依赖并执行入口内核并发调优..."
   export DEBIAN_FRONTEND=noninteractive
   apt update -y >/dev/null 2>&1 || true
-  apt install -y curl tar ca-certificates iproute2 iptables golang-go git openssl coreutils >/dev/null 2>&1
+  apt install -y curl tar ca-certificates iproute2 iptables golang-go coreutils >/dev/null 2>&1
   
   cat << 'EOF' > /etc/sysctl.d/99-nexus.conf
 net.core.default_qdisc=fq
@@ -58,7 +56,7 @@ EOF
 }
 
 install_core_engine() {
-  print_step "2/2" "编译高熵抗 DPI 底层引擎..."
+  print_step "2/2" "本地离线编译高熵引擎 (零外部网络依赖)..."
   mkdir -p /usr/local/src
   cat << 'EOF' > $SRC_PATH
 package main
@@ -77,7 +75,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"golang.org/x/crypto/chacha20poly1305"
+	"crypto/chacha20poly1305" 
 )
 
 const SO_ORIGINAL_DST = 80
@@ -276,18 +274,13 @@ func decodeAndWrite(src net.Conn, dst net.Conn, aead cipher.AEAD) {
 EOF
   cd /usr/local/src
   
-  if ! go mod init darknexus >/dev/null 2>&1; then true; fi
-  if ! go get golang.org/x/crypto/chacha20poly1305 >/dev/null 2>&1; then
-      print_err "依赖拉取失败，请检查网络连通性或 DNS。"
-      exit 1
-  fi
-  
+  # 直接纯本地单文件编译，无需任何外部网络请求
   if ! go build -o $BIN_PATH darknexus.go; then
-      print_err "编译失败！系统环境或 Golang 版本存在异常。"
+      print_err "编译失败！系统自带的 Golang 核心环境存在异常。"
       exit 1
   fi
   
-  print_ok "核心引擎编译完成"
+  print_ok "引擎编译成功！已实现 0 外部网络依赖"
 }
 
 clear_mark_rules() {
@@ -346,7 +339,6 @@ configure_exit() {
   set_role "exit"
   print_block "⏳ 开始配置出口服务器"
   
-  # 调用无内核修改的纯净依赖安装
   install_base_deps_only
   install_core_engine
 
@@ -382,7 +374,6 @@ configure_entry() {
   set_role "entry"
   print_block "⏳ 开始配置入口服务器"
   
-  # 调用包含系统调优的入口依赖安装
   install_deps_and_tune
   install_core_engine
 
@@ -459,7 +450,6 @@ uninstall_wg() {
   
   clear_mark_rules
   
-  # 仅在发现内核调整文件存在时，才执行逆向清理
   if [[ -f /etc/sysctl.d/99-nexus.conf ]]; then
       rm -f /etc/sysctl.d/99-nexus.conf
       sysctl --system >/dev/null 2>&1 || true
