@@ -2,24 +2,26 @@
 set -euo pipefail
 
 # ==========================================================
-# WG + AnyTLS/AnyGo 多入口一出口转发隧道
-# JSON 状态版 + UID路由规避 + DoH安全解析
+# WG + sing-box AnyTLS 多入口一出口转发隧道
+# JSON 状态版
+# 不依赖 /usr/local/bin/anygo
 # ==========================================================
 
 WG_IF="wg0"
 WG_DIR="/etc/wireguard"
-ANY_DIR="/etc/anygo"
-ANY_BIN="/usr/local/bin/anygo"
-ANY_CONFIG="${ANY_DIR}/config.yml"
-STATE_FILE="${ANY_DIR}/state.json"
 
-ANY_USER="anygo"
-ANY_GROUP="anygo"
+SB_DIR="/etc/sing-box"
+SB_CONFIG="${SB_DIR}/wg-anytls.json"
+SB_SERVICE="sing-box-wg-anytls.service"
+SB_BIN=""
+
+STATE_DIR="/etc/anygo"
+STATE_FILE="${STATE_DIR}/state.json"
 
 WG_SAFE_MTU=1320
 WG_SERVER_PORT_DEFAULT=51820
-ANY_SERVER_PORT_DEFAULT=443
-ANY_LOCAL_UDP_PORT_DEFAULT=51820
+ANYTLS_PORT_DEFAULT=443
+LOCAL_WG_UDP_DEFAULT=51820
 ROUTE_TABLE_ID=51820
 
 GREEN='\033[0;32m'
@@ -56,25 +58,10 @@ print_step() {
   echo -e "${CYAN}[$1] $2${NC}"
 }
 
-ensure_anygo_user() {
-  if ! id "$ANY_USER" >/dev/null 2>&1; then
-    useradd -r -M -s /usr/sbin/nologin "$ANY_USER" 2>/dev/null || true
-  fi
-}
-
 ensure_dirs() {
-  mkdir -p "$WG_DIR" "$ANY_DIR"
+  mkdir -p "$WG_DIR" "$SB_DIR" "$STATE_DIR"
   chmod 700 "$WG_DIR" 2>/dev/null || true
-  chmod 750 "$ANY_DIR" 2>/dev/null || true
-}
-
-install_base_packages() {
-  print_step "1/3" "安装基础依赖..."
-  export DEBIAN_FRONTEND=noninteractive
-  apt update -y >/dev/null 2>&1 || true
-  apt install -y curl ca-certificates iproute2 iptables openssl lsb-release wireguard wireguard-tools certbot jq >/dev/null 2>&1
-  ensure_anygo_user
-  print_ok "基础依赖安装完成"
+  chmod 700 "$STATE_DIR" 2>/dev/null || true
 }
 
 ensure_jq() {
@@ -88,7 +75,6 @@ ensure_jq() {
 init_state() {
   ensure_dirs
   ensure_jq
-  ensure_anygo_user
 
   if [[ ! -f "$STATE_FILE" ]]; then
     cat > "$STATE_FILE" <<EOF
@@ -108,28 +94,19 @@ init_state() {
     "domain": "",
     "remote_host": "",
     "remote_ip": "",
-    "remote_port": ${ANY_SERVER_PORT_DEFAULT},
-    "listen_port": ${ANY_SERVER_PORT_DEFAULT},
-    "local_udp_port": ${ANY_LOCAL_UDP_PORT_DEFAULT},
+    "remote_port": ${ANYTLS_PORT_DEFAULT},
+    "listen_port": ${ANYTLS_PORT_DEFAULT},
+    "local_udp_port": ${LOCAL_WG_UDP_DEFAULT},
     "remote_wg_port": ${WG_SERVER_PORT_DEFAULT},
     "password": "",
     "sni": "",
-    "verify_tls": "Y",
-    "padding_mode": "fast"
+    "verify_tls": "Y"
   }
 }
 EOF
   fi
 
-  chmod 640 "$STATE_FILE" 2>/dev/null || true
-  chown root:"$ANY_GROUP" "$STATE_FILE" 2>/dev/null || true
-}
-
-fix_anygo_permissions() {
-  ensure_anygo_user
-  chown -R root:"$ANY_GROUP" "$ANY_DIR" 2>/dev/null || true
-  chmod 750 "$ANY_DIR" 2>/dev/null || true
-  chmod 640 "$ANY_CONFIG" "$STATE_FILE" 2>/dev/null || true
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 state_get() {
@@ -145,25 +122,9 @@ state_set() {
 
   local tmp
   tmp="$(mktemp)"
-
   jq --arg v "$value" "$path = \$v" "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
-  chmod 640 "$STATE_FILE" 2>/dev/null || true
-  chown root:"$ANY_GROUP" "$STATE_FILE" 2>/dev/null || true
-}
-
-state_set_json() {
-  local path="$1"
-  local json="$2"
-  init_state
-
-  local tmp
-  tmp="$(mktemp)"
-
-  jq --argjson v "$json" "$path = \$v" "$STATE_FILE" > "$tmp"
-  mv "$tmp" "$STATE_FILE"
-  chmod 640 "$STATE_FILE" 2>/dev/null || true
-  chown root:"$ANY_GROUP" "$STATE_FILE" 2>/dev/null || true
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 state_add_port() {
@@ -172,11 +133,9 @@ state_add_port() {
 
   local tmp
   tmp="$(mktemp)"
-
   jq --argjson p "$port" '.ports = ((.ports + [$p]) | unique | sort)' "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
-  chmod 640 "$STATE_FILE" 2>/dev/null || true
-  chown root:"$ANY_GROUP" "$STATE_FILE" 2>/dev/null || true
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 state_remove_port() {
@@ -185,11 +144,9 @@ state_remove_port() {
 
   local tmp
   tmp="$(mktemp)"
-
   jq --argjson p "$port" '.ports = (.ports | map(select(. != $p)))' "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
-  chmod 640 "$STATE_FILE" 2>/dev/null || true
-  chown root:"$ANY_GROUP" "$STATE_FILE" 2>/dev/null || true
+  chmod 600 "$STATE_FILE" 2>/dev/null || true
 }
 
 get_role() {
@@ -211,12 +168,12 @@ set_mode_flag() {
 }
 
 rand_pass() {
-  tr -dc 'A-Za-z0-9' </dev/urandom | head -c 18 || true
+  openssl rand -base64 18 | tr -d '\n' | tr '+/' 'AZ' | cut -c1-22
 }
 
 get_wan_if() {
   local wan
-  wan=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)
+  wan="$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if ($i=="dev") {print $(i+1); exit}}' || true)"
   echo "${wan:-eth0}"
 }
 
@@ -251,69 +208,52 @@ resolve_ipv4() {
   echo "$ip"
 }
 
+install_base_packages() {
+  print_step "1/3" "安装基础依赖..."
+  export DEBIAN_FRONTEND=noninteractive
+  apt update -y >/dev/null 2>&1 || true
+  apt install -y curl ca-certificates iproute2 iptables openssl lsb-release wireguard wireguard-tools certbot jq >/dev/null 2>&1
+  print_ok "基础依赖安装完成"
+}
+
+install_sing_box() {
+  print_step "2/3" "检查并安装 sing-box..."
+
+  if command -v sing-box >/dev/null 2>&1; then
+    SB_BIN="$(command -v sing-box)"
+    print_ok "sing-box 已存在: ${SB_BIN}"
+    return 0
+  fi
+
+  curl -fsSL https://sing-box.app/install.sh | sh
+
+  if command -v sing-box >/dev/null 2>&1; then
+    SB_BIN="$(command -v sing-box)"
+    print_ok "sing-box 安装完成: ${SB_BIN}"
+  else
+    print_err "sing-box 安装失败"
+    exit 1
+  fi
+}
+
+ensure_sing_box_bin() {
+  if command -v sing-box >/dev/null 2>&1; then
+    SB_BIN="$(command -v sing-box)"
+  elif [[ -x /usr/bin/sing-box ]]; then
+    SB_BIN="/usr/bin/sing-box"
+  elif [[ -x /usr/local/bin/sing-box ]]; then
+    SB_BIN="/usr/local/bin/sing-box"
+  else
+    print_err "未找到 sing-box，请先安装或运行配置菜单自动安装"
+    exit 1
+  fi
+}
+
 enable_ip_forward_global() {
   echo 1 > /proc/sys/net/ipv4/ip_forward 2>/dev/null || true
   sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
   echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
   sysctl -p >/dev/null 2>&1 || true
-}
-
-check_anygo_bin() {
-  if [[ ! -x "$ANY_BIN" ]]; then
-    print_err "未找到 AnyGo/AnyTLS 主程序: ${ANY_BIN}"
-    echo
-    echo "请先把你的 anygo/anytls 二进制放到："
-    echo "  ${ANY_BIN}"
-    echo
-    echo "然后执行："
-    echo "  chmod +x ${ANY_BIN}"
-    echo
-    exit 1
-  fi
-
-  print_ok "检测到 AnyGo/AnyTLS: ${ANY_BIN}"
-}
-
-ensure_anygo_uid_bypass() {
-  local uid
-  uid="$(id -u "$ANY_USER" 2>/dev/null || true)"
-  [[ -n "$uid" ]] || return 0
-
-  iptables -t mangle -C OUTPUT -m owner --uid-owner "$uid" -j RETURN 2>/dev/null || \
-    iptables -t mangle -I OUTPUT 1 -m owner --uid-owner "$uid" -j RETURN
-}
-
-get_padding_fast() {
-  cat <<'EOF'
-stop=3
-0=80-180
-1=120-300
-2=120-300
-3=120-300
-EOF
-}
-
-get_padding_strong() {
-  cat <<'EOF'
-stop=8
-0=30-30
-1=100-400
-2=400-500,c,500-1000,c,500-1000,c,500-1000,c,500-1000
-3=9-9,500-1000
-4=500-1000
-5=500-1000
-6=500-1000
-7=500-1000
-EOF
-}
-
-write_padding_yaml() {
-  local mode="$1"
-  if [[ "$mode" == "strong" ]]; then
-    get_padding_strong | sed 's/^/  /'
-  else
-    get_padding_fast | sed 's/^/  /'
-  fi
 }
 
 issue_cert_standalone() {
@@ -337,163 +277,6 @@ calc_wg_cidr24() {
   local wg_addr="$1"
   local ip="${wg_addr%%/*}"
   awk -F. '{print $1"."$2"."$3".0/24"}' <<< "$ip"
-}
-
-setup_exit_anytls_service() {
-  local listen_port="$1"
-  local wg_udp_port="$2"
-  local domain="$3"
-  local password="$4"
-  local sni="$5"
-  local padding_mode="$6"
-
-  ensure_dirs
-  init_state
-
-  cat > "$ANY_CONFIG" <<EOF
-log_level: "info"
-
-idle_session_check_interval: "30s"
-idle_session_timeout: "60s"
-min_idle_session: 2
-
-padding_scheme: |
-$(write_padding_yaml "$padding_mode")
-
-tunnels:
-  - listen: "[::]:${listen_port}"
-    remote: "127.0.0.1:${wg_udp_port}"
-    sni: "${sni}"
-    password: "${password}"
-    cert: "/etc/letsencrypt/live/${domain}/fullchain.pem"
-    key: "/etc/letsencrypt/live/${domain}/privkey.pem"
-    max_conns: 0
-EOF
-
-  cat > /etc/systemd/system/anygo-exit.service <<EOF
-[Unit]
-Description=AnyTLS Exit Server
-After=network-online.target wg-quick@${WG_IF}.service
-Requires=wg-quick@${WG_IF}.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${ANY_BIN} -c ${ANY_CONFIG}
-Restart=always
-RestartSec=2
-User=root
-LimitNOFILE=1048576
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  fix_anygo_permissions
-
-  systemctl daemon-reload
-  systemctl enable anygo-exit.service >/dev/null 2>&1 || true
-  systemctl restart anygo-exit.service
-
-  state_set '.anytls.domain' "$domain"
-  state_set '.anytls.listen_port' "$listen_port"
-  state_set '.anytls.remote_wg_port' "$wg_udp_port"
-  state_set '.anytls.password' "$password"
-  state_set '.anytls.sni' "$sni"
-  state_set '.anytls.padding_mode' "$padding_mode"
-}
-
-setup_entry_anytls_service() {
-  local remote_host="$1"
-  local remote_port="$2"
-  local local_udp_port="$3"
-  local remote_wg_port="$4"
-  local password="$5"
-  local sni="$6"
-  local verify_tls="$7"
-  local padding_mode="$8"
-
-  ensure_dirs
-  init_state
-  ensure_anygo_user
-
-  local connect_host remote_ip
-  remote_ip="$(resolve_ipv4 "$remote_host")"
-
-  if [[ -n "$remote_ip" ]]; then
-    connect_host="$remote_ip"
-  else
-    connect_host="$remote_host"
-  fi
-
-  local insecure_line=""
-  if [[ "$verify_tls" =~ ^[Nn]$ ]]; then
-    insecure_line='    insecure: true'
-  else
-    insecure_line='    insecure: false'
-  fi
-
-  cat > "$ANY_CONFIG" <<EOF
-log_level: "info"
-
-idle_session_check_interval: "30s"
-idle_session_timeout: "60s"
-min_idle_session: 2
-
-padding_scheme: |
-$(write_padding_yaml "$padding_mode")
-
-tunnels:
-  - listen: "127.0.0.1:${local_udp_port}"
-    remote: "${connect_host}:${remote_port}"
-    sni: "${sni}"
-    password: "${password}"
-${insecure_line}
-    max_conns: 0
-EOF
-
-  cat > /etc/systemd/system/anygo-entry.service <<EOF
-[Unit]
-Description=AnyTLS Entry Client
-After=network-online.target
-Before=wg-quick@${WG_IF}.service
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=${ANY_BIN} -c ${ANY_CONFIG}
-Restart=always
-RestartSec=2
-User=${ANY_USER}
-Group=${ANY_GROUP}
-LimitNOFILE=1048576
-NoNewPrivileges=true
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  fix_anygo_permissions
-
-  systemctl daemon-reload
-  systemctl enable anygo-entry.service >/dev/null 2>&1 || true
-  systemctl restart anygo-entry.service
-
-  state_set '.anytls.remote_host' "$remote_host"
-  state_set '.anytls.remote_ip' "$remote_ip"
-  state_set '.anytls.remote_port' "$remote_port"
-  state_set '.anytls.local_udp_port' "$local_udp_port"
-  state_set '.anytls.remote_wg_port' "$remote_wg_port"
-  state_set '.anytls.password' "$password"
-  state_set '.anytls.sni' "$sni"
-  state_set '.anytls.verify_tls' "$verify_tls"
-  state_set '.anytls.padding_mode' "$padding_mode"
-
-  ensure_anygo_uid_bypass
 }
 
 configure_exit_wg() {
@@ -526,16 +309,13 @@ PostDown = iptables -D FORWARD -i ${WG_IF} -o ${out_if} -j ACCEPT 2>/dev/null ||
 EOF
 
   chmod 600 "${WG_DIR}/${WG_IF}.conf"
-  enable_ip_forward_global
 
+  enable_ip_forward_global
   systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
   wg-quick down "${WG_IF}" 2>/dev/null || true
   wg-quick up "${WG_IF}"
 
-  local exit_public_key
-  exit_public_key="$(cat "${WG_DIR}/exit_public.key" 2>/dev/null || true)"
-
-  state_set '.wg.exit_public_key' "$exit_public_key"
+  state_set '.wg.exit_public_key' "$(cat "${WG_DIR}/exit_public.key" 2>/dev/null || true)"
 }
 
 configure_entry_wg() {
@@ -574,31 +354,199 @@ EOF
 
   chmod 600 "${WG_DIR}/${WG_IF}.conf"
 
-  local entry_public_key
-  entry_public_key="$(cat "${WG_DIR}/entry_public.key" 2>/dev/null || true)"
-
   state_set '.wg.exit_wg_ip' "$exit_wg_ip_no_mask"
   state_set '.wg.entry_wg_ip' "$wg_addr"
-  state_set '.wg.entry_public_key' "$entry_public_key"
+  state_set '.wg.entry_public_key' "$(cat "${WG_DIR}/entry_public.key" 2>/dev/null || true)"
 
   systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
   wg-quick down "${WG_IF}" 2>/dev/null || true
   wg-quick up "${WG_IF}"
 }
 
-ensure_server_bypass_route() {
-  local remote_host remote_ip wan_if gateway
+write_exit_singbox_config() {
+  local listen_port="$1"
+  local wg_udp_port="$2"
+  local domain="$3"
+  local password="$4"
 
-  remote_ip="$(state_get '.anytls.remote_ip')"
+  ensure_dirs
+  ensure_sing_box_bin
 
-  if [[ -z "${remote_ip:-}" ]]; then
-    remote_host="$(state_get '.anytls.remote_host')"
-    [[ -n "$remote_host" ]] || return 0
-    remote_ip="$(resolve_ipv4 "$remote_host")"
-    [[ -n "$remote_ip" ]] || remote_ip="$remote_host"
+  cat > "$SB_CONFIG" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-in",
+      "listen": "::",
+      "listen_port": ${listen_port},
+      "users": [
+        {
+          "name": "wg-tunnel",
+          "password": "${password}"
+        }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "${domain}",
+        "certificate_path": "/etc/letsencrypt/live/${domain}/fullchain.pem",
+        "key_path": "/etc/letsencrypt/live/${domain}/privkey.pem"
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "direct",
+      "tag": "direct"
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "anytls-in",
+        "action": "route-options",
+        "override_address": "127.0.0.1",
+        "override_port": ${wg_udp_port}
+      }
+    ],
+    "final": "direct"
+  }
+}
+EOF
+
+  "$SB_BIN" check -c "$SB_CONFIG"
+
+  cat > "/etc/systemd/system/${SB_SERVICE}" <<EOF
+[Unit]
+Description=sing-box AnyTLS WG Exit
+After=network-online.target wg-quick@${WG_IF}.service
+Requires=wg-quick@${WG_IF}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SB_BIN} run -c ${SB_CONFIG}
+Restart=always
+RestartSec=2
+User=root
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$SB_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SB_SERVICE"
+}
+
+write_entry_singbox_config() {
+  local remote_host="$1"
+  local remote_port="$2"
+  local local_udp_port="$3"
+  local remote_wg_port="$4"
+  local password="$5"
+  local sni="$6"
+  local verify_tls="$7"
+
+  ensure_dirs
+  ensure_sing_box_bin
+
+  local remote_ip
+  remote_ip="$(resolve_ipv4 "$remote_host")"
+  [[ -z "$remote_ip" ]] && remote_ip="$remote_host"
+
+  local insecure="false"
+  if [[ "$verify_tls" =~ ^[Nn]$ ]]; then
+    insecure="true"
   fi
 
-  [[ -n "${remote_ip:-}" ]] || return 0
+  cat > "$SB_CONFIG" <<EOF
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "direct",
+      "tag": "wg-udp-in",
+      "listen": "127.0.0.1",
+      "listen_port": ${local_udp_port},
+      "network": "udp",
+      "override_address": "127.0.0.1",
+      "override_port": ${remote_wg_port}
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "anytls",
+      "tag": "anytls-out",
+      "server": "${remote_ip}",
+      "server_port": ${remote_port},
+      "password": "${password}",
+      "tls": {
+        "enabled": true,
+        "server_name": "${sni}",
+        "insecure": ${insecure}
+      }
+    }
+  ],
+  "route": {
+    "rules": [
+      {
+        "inbound": "wg-udp-in",
+        "outbound": "anytls-out"
+      }
+    ],
+    "final": "anytls-out"
+  }
+}
+EOF
+
+  "$SB_BIN" check -c "$SB_CONFIG"
+
+  cat > "/etc/systemd/system/${SB_SERVICE}" <<EOF
+[Unit]
+Description=sing-box AnyTLS WG Entry
+After=network-online.target
+Before=wg-quick@${WG_IF}.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${SB_BIN} run -c ${SB_CONFIG}
+Restart=always
+RestartSec=2
+User=root
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable "$SB_SERVICE" >/dev/null 2>&1 || true
+  systemctl restart "$SB_SERVICE"
+
+  state_set '.anytls.remote_host' "$remote_host"
+  state_set '.anytls.remote_ip' "$remote_ip"
+  state_set '.anytls.remote_port' "$remote_port"
+  state_set '.anytls.local_udp_port' "$local_udp_port"
+  state_set '.anytls.remote_wg_port' "$remote_wg_port"
+  state_set '.anytls.password' "$password"
+  state_set '.anytls.sni' "$sni"
+  state_set '.anytls.verify_tls' "$verify_tls"
+}
+
+ensure_server_bypass_route() {
+  local remote_ip wan_if gateway
+  remote_ip="$(state_get '.anytls.remote_ip')"
+  [[ -n "$remote_ip" ]] || return 0
 
   wan_if="$(get_wan_if)"
   gateway="$(get_main_gateway)"
@@ -624,7 +572,6 @@ ensure_policy_routing() {
 
   ip route replace default dev "$WG_IF" table ${ROUTE_TABLE_ID} 2>/dev/null || true
   ensure_server_bypass_route
-  ensure_anygo_uid_bypass
 }
 
 remove_port_iptables_rules() {
@@ -637,7 +584,6 @@ remove_port_iptables_rules() {
 
 apply_port_rules_from_state() {
   clear_mark_rules
-  ensure_anygo_uid_bypass
 
   local ports
   ports="$(jq -r '.ports[]?' "$STATE_FILE" 2>/dev/null || true)"
@@ -708,7 +654,6 @@ enable_split_mode() {
 
   ensure_policy_routing
   clear_mark_rules
-  ensure_anygo_uid_bypass
   apply_port_rules_from_state
 
   local ports
@@ -720,7 +665,7 @@ enable_split_mode() {
   done <<< "$ports"
 
   ip link set dev "$WG_IF" mtu "$WG_SAFE_MTU" 2>/dev/null || true
-  set_mode_flag "split"
+  state_set '.mode' "split"
 }
 
 enable_global_mode() {
@@ -728,7 +673,6 @@ enable_global_mode() {
 
   ensure_policy_routing
   clear_mark_rules
-  ensure_anygo_uid_bypass
 
   wan_if="$(get_wan_if)"
   exit_ip="$(state_get '.wg.exit_wg_ip')"
@@ -755,7 +699,7 @@ enable_global_mode() {
   iptables -t mangle -C PREROUTING -i "$wan_if" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -i "$wan_if" -j MARK --set-mark 0x1
 
   ip link set dev "$WG_IF" mtu "$WG_SAFE_MTU" 2>/dev/null || true
-  set_mode_flag "global"
+  state_set '.mode' "global"
 }
 
 suggest_next_peer_ip() {
@@ -831,7 +775,7 @@ configure_exit() {
   print_block "配置出口服务器"
 
   install_base_packages
-  check_anygo_bin
+  install_sing_box
 
   cd "$WG_DIR"
 
@@ -846,7 +790,7 @@ configure_exit() {
   print_block "本机出口 WireGuard 公钥"
   echo "$exit_public_key"
 
-  local domain listen_port wg_addr wg_udp_port out_if password sni padding_mode cert_choice padding_choice
+  local domain listen_port wg_addr wg_udp_port out_if password cert_choice
 
   while true; do
     read -rp "出口域名，必须解析到本机: " domain
@@ -854,8 +798,8 @@ configure_exit() {
     print_err "域名不能为空"
   done
 
-  read -rp "AnyTLS 对外监听端口，默认 ${ANY_SERVER_PORT_DEFAULT}: " listen_port
-  listen_port="${listen_port:-$ANY_SERVER_PORT_DEFAULT}"
+  read -rp "AnyTLS 对外监听端口，默认 ${ANYTLS_PORT_DEFAULT}: " listen_port
+  listen_port="${listen_port:-$ANYTLS_PORT_DEFAULT}"
 
   read -rp "出口 WG 内网 IP，默认 10.66.0.1/24: " wg_addr
   wg_addr="${wg_addr:-10.66.0.1/24}"
@@ -873,20 +817,6 @@ configure_exit() {
   read -rp "AnyTLS 密码，默认随机 ${default_pass}: " password
   password="${password:-$default_pass}"
 
-  read -rp "SNI，默认使用出口真实域名 ${domain}: " sni
-  sni="${sni:-$domain}"
-
-  echo
-  echo "Padding 模式："
-  echo "1) fast   速度优先"
-  echo "2) strong 抗识别优先，流量更大"
-  read -rp "请选择，默认 1: " padding_choice
-  if [[ "${padding_choice:-1}" == "2" ]]; then
-    padding_mode="strong"
-  else
-    padding_mode="fast"
-  fi
-
   read -rp "是否现在申请 Let's Encrypt 证书? (Y/n): " cert_choice
   cert_choice="${cert_choice:-Y}"
 
@@ -899,9 +829,14 @@ configure_exit() {
   fi
 
   configure_exit_wg "$wg_addr" "$out_if" "$wg_udp_port"
-  setup_exit_anytls_service "$listen_port" "$wg_udp_port" "$domain" "$password" "$sni" "$padding_mode"
+  write_exit_singbox_config "$listen_port" "$wg_udp_port" "$domain" "$password"
 
   state_set '.role' "exit"
+  state_set '.anytls.domain' "$domain"
+  state_set '.anytls.listen_port' "$listen_port"
+  state_set '.anytls.password' "$password"
+  state_set '.anytls.sni' "$domain"
+  state_set '.anytls.remote_wg_port' "$wg_udp_port"
   state_set '.wg.exit_public_key' "$exit_public_key"
 
   print_block "出口配置完成"
@@ -910,8 +845,6 @@ configure_exit() {
   echo "WG 地址: ${wg_addr}"
   echo "WG UDP: ${wg_udp_port}"
   echo "AnyTLS 密码: ${password}"
-  echo "SNI: ${sni}"
-  echo "Padding: ${padding_mode}"
   echo
   echo "把下面这个出口公钥复制给入口机："
   echo "${exit_public_key}"
@@ -927,7 +860,7 @@ configure_entry() {
   print_block "配置入口服务器"
 
   install_base_packages
-  check_anygo_bin
+  install_sing_box
 
   cd "$WG_DIR"
 
@@ -942,7 +875,7 @@ configure_entry() {
   print_block "本机入口 WireGuard 公钥"
   echo "$entry_public_key"
 
-  local wg_addr exit_wg_ip exit_public_key remote_host remote_port local_udp_port remote_wg_port password sni verify_tls padding_mode padding_choice
+  local wg_addr exit_wg_ip exit_public_key remote_host remote_port local_udp_port remote_wg_port password sni verify_tls
 
   read -rp "入口 WG 内网 IP，例如 10.66.0.2/24: " wg_addr
   wg_addr="${wg_addr:-10.66.0.2/24}"
@@ -956,11 +889,11 @@ configure_entry() {
     print_err "出口地址不能为空"
   done
 
-  read -rp "出口 AnyTLS 端口，默认 ${ANY_SERVER_PORT_DEFAULT}: " remote_port
-  remote_port="${remote_port:-$ANY_SERVER_PORT_DEFAULT}"
+  read -rp "出口 AnyTLS 端口，默认 ${ANYTLS_PORT_DEFAULT}: " remote_port
+  remote_port="${remote_port:-$ANYTLS_PORT_DEFAULT}"
 
-  read -rp "入口本地 AnyTLS UDP 监听端口，默认 ${ANY_LOCAL_UDP_PORT_DEFAULT}: " local_udp_port
-  local_udp_port="${local_udp_port:-$ANY_LOCAL_UDP_PORT_DEFAULT}"
+  read -rp "入口本地 sing-box UDP 监听端口，默认 ${LOCAL_WG_UDP_DEFAULT}: " local_udp_port
+  local_udp_port="${local_udp_port:-$LOCAL_WG_UDP_DEFAULT}"
 
   read -rp "远端出口 WG UDP 端口，默认 ${WG_SERVER_PORT_DEFAULT}: " remote_wg_port
   remote_wg_port="${remote_wg_port:-$WG_SERVER_PORT_DEFAULT}"
@@ -977,33 +910,20 @@ configure_entry() {
   read -rp "是否严格校验证书? (Y/n): " verify_tls
   verify_tls="${verify_tls:-Y}"
 
-  echo
-  echo "Padding 模式必须和出口一致："
-  echo "1) fast"
-  echo "2) strong"
-  read -rp "请选择，默认 1: " padding_choice
-  if [[ "${padding_choice:-1}" == "2" ]]; then
-    padding_mode="strong"
-  else
-    padding_mode="fast"
-  fi
-
   while true; do
     read -rp "出口 WireGuard 公钥: " exit_public_key
     [[ -n "$exit_public_key" ]] && break
     print_err "出口公钥不能为空"
   done
 
-  setup_entry_anytls_service "$remote_host" "$remote_port" "$local_udp_port" "$remote_wg_port" "$password" "$sni" "$verify_tls" "$padding_mode"
+  write_entry_singbox_config "$remote_host" "$remote_port" "$local_udp_port" "$remote_wg_port" "$password" "$sni" "$verify_tls"
   configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
 
   ensure_server_bypass_route
-  ensure_anygo_uid_bypass
-  set_mode_flag "split"
-  enable_split_mode
-
   state_set '.role' "entry"
   state_set '.wg.entry_public_key' "$entry_public_key"
+
+  enable_split_mode
 
   print_block "入口配置完成"
   echo "入口 WG 地址: ${wg_addr}"
@@ -1029,7 +949,7 @@ update_entry_remote() {
   saved_local="$(state_get '.anytls.local_udp_port')"
   saved_remote_wg="$(state_get '.anytls.remote_wg_port')"
 
-  local remote_host remote_port password sni verify_tls local_udp remote_wg padding_mode padding_choice
+  local remote_host remote_port password sni verify_tls local_udp remote_wg
 
   read -rp "新出口域名/IP，默认 ${saved_host}: " remote_host
   remote_host="${remote_host:-$saved_host}"
@@ -1046,23 +966,11 @@ update_entry_remote() {
   read -rp "是否严格校验证书，默认 ${saved_verify:-Y}: " verify_tls
   verify_tls="${verify_tls:-${saved_verify:-Y}}"
 
-  local_udp="${saved_local:-$ANY_LOCAL_UDP_PORT_DEFAULT}"
+  local_udp="${saved_local:-$LOCAL_WG_UDP_DEFAULT}"
   remote_wg="${saved_remote_wg:-$WG_SERVER_PORT_DEFAULT}"
 
-  echo
-  echo "Padding 模式："
-  echo "1) fast"
-  echo "2) strong"
-  read -rp "请选择，默认 1: " padding_choice
-  if [[ "${padding_choice:-1}" == "2" ]]; then
-    padding_mode="strong"
-  else
-    padding_mode="fast"
-  fi
-
-  setup_entry_anytls_service "$remote_host" "$remote_port" "$local_udp" "$remote_wg" "$password" "$sni" "$verify_tls" "$padding_mode"
+  write_entry_singbox_config "$remote_host" "$remote_port" "$local_udp" "$remote_wg" "$password" "$sni" "$verify_tls"
   ensure_server_bypass_route
-  ensure_anygo_uid_bypass
 
   print_ok "入口远端已更新: ${remote_host}:${remote_port}"
   echo "AnyTLS 实际连接 IP: $(state_get '.anytls.remote_ip')"
@@ -1089,22 +997,18 @@ refresh_remote_ip() {
     return 1
   fi
 
-  state_set '.anytls.remote_ip' "$ip"
-  ensure_server_bypass_route
-  ensure_anygo_uid_bypass
-
-  local remote_port local_udp remote_wg password sni verify padding
+  local remote_port local_udp remote_wg password sni verify
   remote_port="$(state_get '.anytls.remote_port')"
   local_udp="$(state_get '.anytls.local_udp_port')"
   remote_wg="$(state_get '.anytls.remote_wg_port')"
   password="$(state_get '.anytls.password')"
   sni="$(state_get '.anytls.sni')"
   verify="$(state_get '.anytls.verify_tls')"
-  padding="$(state_get '.anytls.padding_mode')"
 
-  setup_entry_anytls_service "$host" "$remote_port" "$local_udp" "$remote_wg" "$password" "$sni" "$verify" "$padding"
+  write_entry_singbox_config "$host" "$remote_port" "$local_udp" "$remote_wg" "$password" "$sni" "$verify"
+  ensure_server_bypass_route
 
-  print_ok "已重新解析并更新出口 IP: ${host} -> ${ip}"
+  print_ok "已重新解析并更新出口 IP: ${host} -> $(state_get '.anytls.remote_ip')"
 }
 
 manage_entry_ports() {
@@ -1208,13 +1112,8 @@ show_status() {
     echo "出口域名: $(state_get '.anytls.domain')"
     echo "AnyTLS端口: $(state_get '.anytls.listen_port')"
     echo "AnyTLS密码: $(state_get '.anytls.password')"
-    echo "SNI: $(state_get '.anytls.sni')"
     [[ -f "${WG_DIR}/exit_public.key" ]] && echo "出口WG公钥: $(cat "${WG_DIR}/exit_public.key" 2>/dev/null || true)"
     [[ -f "${WG_DIR}/exit_private.key" ]] && echo "出口WG私钥: 已存在，不显示"
-    echo
-
-    echo "入口机配置时需要填："
-    echo "出口域名 / AnyTLS端口 / AnyTLS密码 / SNI / 出口WG公钥"
     echo
 
     echo "出口当前已添加的入口 Peer："
@@ -1233,12 +1132,8 @@ show_status() {
     echo "出口AnyTLS端口: $(state_get '.anytls.remote_port')"
     echo "AnyTLS密码: $(state_get '.anytls.password')"
     echo "SNI: $(state_get '.anytls.sni')"
-    echo "本地AnyTLS UDP监听: $(state_get '.anytls.local_udp_port')"
+    echo "本地UDP监听: $(state_get '.anytls.local_udp_port')"
     echo "出口WG内网IP: $(state_get '.wg.exit_wg_ip')"
-    echo
-
-    echo "回出口机菜单 12 添加 Peer 时需要填："
-    echo "入口WG公钥 + 入口WG内网IP，例如 10.66.0.2/32"
     echo
 
     echo "当前入口分流端口："
@@ -1253,17 +1148,12 @@ show_status() {
   wg show || true
 
   echo
-  echo "================ systemd 状态 ================"
-  systemctl --no-pager --full status anygo-exit.service 2>/dev/null | sed -n '1,12p' || true
-  systemctl --no-pager --full status anygo-entry.service 2>/dev/null | sed -n '1,12p' || true
+  echo "================ sing-box 状态 ================"
+  systemctl --no-pager --full status "$SB_SERVICE" 2>/dev/null | sed -n '1,15p' || true
 
   echo
   echo "================ 监听端口 ================"
-  ss -lntup | grep -E 'anygo|wg|51820|443' || true
-
-  echo
-  echo "================ UID免检规则 ================"
-  iptables -t mangle -S OUTPUT 2>/dev/null | grep -E "uid-owner|MARK|RETURN" || true
+  ss -lntup | grep -E 'sing-box|wg|51820|443' || true
 
   echo
   echo "================ WG 配置关键信息 ================"
@@ -1279,15 +1169,14 @@ start_all() {
   if [[ "$role" == "exit" ]]; then
     systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
     wg-quick up "$WG_IF" 2>/dev/null || true
-    systemctl restart anygo-exit.service 2>/dev/null || true
+    systemctl restart "$SB_SERVICE" 2>/dev/null || true
     print_ok "出口服务已启动"
   elif [[ "$role" == "entry" ]]; then
-    systemctl restart anygo-entry.service 2>/dev/null || true
+    systemctl restart "$SB_SERVICE" 2>/dev/null || true
     sleep 1
     systemctl enable "wg-quick@${WG_IF}.service" >/dev/null 2>&1 || true
     wg-quick up "$WG_IF" 2>/dev/null || true
     ensure_server_bypass_route
-    ensure_anygo_uid_bypass
 
     if [[ "$(get_current_mode)" == "global" ]]; then
       enable_global_mode
@@ -1302,17 +1191,9 @@ start_all() {
 }
 
 stop_all() {
-  local role
-  role="$(get_role)"
-
   print_block "停止服务"
 
-  if [[ "$role" == "exit" ]]; then
-    systemctl stop anygo-exit.service 2>/dev/null || true
-  elif [[ "$role" == "entry" ]]; then
-    systemctl stop anygo-entry.service 2>/dev/null || true
-  fi
-
+  systemctl stop "$SB_SERVICE" 2>/dev/null || true
   wg-quick down "$WG_IF" 2>/dev/null || true
   ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
   ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true
@@ -1331,11 +1212,9 @@ uninstall_all() {
 
   set +e
 
-  systemctl stop anygo-exit.service 2>/dev/null || true
-  systemctl stop anygo-entry.service 2>/dev/null || true
-  systemctl disable anygo-exit.service 2>/dev/null || true
-  systemctl disable anygo-entry.service 2>/dev/null || true
-  rm -f /etc/systemd/system/anygo-exit.service /etc/systemd/system/anygo-entry.service
+  systemctl stop "$SB_SERVICE" 2>/dev/null || true
+  systemctl disable "$SB_SERVICE" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SB_SERVICE}"
   systemctl daemon-reload 2>/dev/null || true
 
   systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
@@ -1366,24 +1245,24 @@ uninstall_all() {
     iptables $line 2>/dev/null || true
   done
 
-  rm -rf "$ANY_DIR"
-  rm -rf "$WG_DIR"
+  rm -rf "$WG_DIR" "$STATE_DIR"
+  rm -f "$SB_CONFIG"
 
   sed -i '/net.ipv4.ip_forward=1/d' /etc/sysctl.conf 2>/dev/null || true
   sysctl -p >/dev/null 2>&1 || true
 
   print_ok "配置和服务已清理"
-  print_warn "没有删除 ${ANY_BIN}，如需删除请手动执行：rm -f ${ANY_BIN}"
+  print_warn "没有卸载 sing-box，如需删除请手动处理"
 
   set -e
 }
 
 test_wrap_status() {
-  print_block "检测 WG 是否被 AnyTLS 包住"
+  print_block "检测 WG 是否被 sing-box AnyTLS 包住"
 
   echo "入口正确状态应该是："
   echo "1) WG Endpoint = 127.0.0.1:51820"
-  echo "2) AnyGo 进程 UID 被 OUTPUT 免检"
+  echo "2) sing-box 监听本地 UDP 51820"
   echo "3) 公网只看到入口 -> 出口:AnyTLS端口"
   echo "4) 不应该看到入口 -> 出口:51820 UDP"
   echo
@@ -1392,12 +1271,8 @@ test_wrap_status() {
   grep -n "Endpoint" "${WG_DIR}/${WG_IF}.conf" 2>/dev/null || true
   echo
 
-  echo "当前 AnyTLS 配置："
-  sed -n '1,120p' "$ANY_CONFIG" 2>/dev/null || true
-  echo
-
-  echo "当前 UID 免检规则："
-  iptables -t mangle -S OUTPUT 2>/dev/null | grep uid-owner || true
+  echo "当前 sing-box 配置："
+  sed -n '1,220p' "$SB_CONFIG" 2>/dev/null || true
   echo
 
   echo "入口机检测命令："
@@ -1421,7 +1296,6 @@ export_node_info() {
       "出口域名: \(.anytls.domain)",
       "AnyTLS端口: \(.anytls.listen_port)",
       "AnyTLS密码: \(.anytls.password)",
-      "SNI: \(.anytls.sni)",
       "出口WG公钥: \(.wg.exit_public_key)"
     ' "$STATE_FILE"
   elif [[ "$role" == "entry" ]]; then
@@ -1449,7 +1323,7 @@ while true; do
   init_state
 
   echo
-  echo "================ WG + AnyTLS/AnyGo JSON + UID版 ================"
+  echo "================ WG + sing-box AnyTLS 多入口一出口 ================"
   echo "1) 配置为出口服务器"
   echo "2) 配置为入口服务器"
   echo "3) 查看状态"
@@ -1466,7 +1340,7 @@ while true; do
   echo "14) 重新解析出口 IP，仅入口"
   echo "15) 查看 JSON 状态"
   echo "0) 退出"
-  echo "==============================================================="
+  echo "==================================================================="
   read -rp "请选择: " choice
 
   case "$choice" in
