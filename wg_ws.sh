@@ -111,79 +111,6 @@ enable_ip_forward_global() {
   sysctl -p >/dev/null 2>&1 || true
 }
 
-validate_wg_public_key() {
-  local key="$1"
-  [[ "$key" =~ ^[A-Za-z0-9+/]{43}=$ ]]
-}
-
-write_wg_keypair_from_private() {
-  local private_key="$1" private_file="$2" public_file="$3"
-  local public_key
-
-  public_key="$(printf '%s\n' "$private_key" | wg pubkey 2>/dev/null || true)"
-  [[ -n "$public_key" ]] || return 1
-
-  umask 077
-  printf '%s\n' "$private_key" > "$private_file"
-  printf '%s\n' "$public_key" > "$public_file"
-}
-
-prompt_local_wg_keypair() {
-  local role_label="$1" private_file="$2" public_file="$3"
-  local private_key
-
-  while true; do
-    read -rp "请输入本机（${role_label}服务器）私钥，回车自动生成: " private_key
-    echo
-
-    if [[ -z "$private_key" ]]; then
-      umask 077
-      wg genkey > "$private_file"
-      wg pubkey < "$private_file" > "$public_file"
-      print_ok "本机（${role_label}服务器）密钥已自动生成"
-      return 0
-    fi
-
-    if write_wg_keypair_from_private "$private_key" "$private_file" "$public_file"; then
-      print_ok "本机（${role_label}服务器）自定义密钥已保存"
-      return 0
-    fi
-
-    print_err "私钥格式无效，请重新输入，或直接回车自动生成"
-  done
-}
-
-prompt_peer_public_key() {
-  local result_var="$1" peer_label="$2"
-  local public_key private_key
-
-  while true; do
-    read -rp "请输入【${peer_label}服务器公钥】，回车自动生成一套${peer_label}密钥: " public_key
-
-    if [[ -z "$public_key" ]]; then
-      private_key="$(wg genkey)"
-      public_key="$(printf '%s\n' "$private_key" | wg pubkey)"
-
-      print_block "已自动生成【${peer_label}服务器】密钥"
-      echo "【${peer_label}服务器私钥】"
-      echo "$private_key"
-      echo
-      echo "【${peer_label}服务器公钥】"
-      echo "$public_key"
-      print_warn "请保存上面的私钥；配置${peer_label}服务器时粘贴它，才能和当前机器匹配"
-      printf -v "$result_var" '%s' "$public_key"
-      return 0
-    fi
-
-    if validate_wg_public_key "$public_key"; then
-      printf -v "$result_var" '%s' "$public_key"
-      return 0
-    fi
-
-    print_err "公钥格式无效，请重新输入，或直接回车自动生成"
-  done
-}
-
 save_wst_params() {
   local host="$1" port="$2" path="$3" verify="$4"
   path="$(normalize_path_prefix "$path")"
@@ -1859,7 +1786,12 @@ configure_exit() {
   install_wstunnel
 
   cd "$WG_DIR"
-  prompt_local_wg_keypair "出口" "exit_private.key" "exit_public.key"
+  if [[ ! -f exit_private.key ]]; then
+    (
+      umask 077
+      wg genkey | tee exit_private.key | wg pubkey > exit_public.key
+    )
+  fi
   local exit_public_key
   exit_public_key="$(cat exit_public.key)"
 
@@ -1932,7 +1864,10 @@ configure_exit() {
   write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix" "$ws_port" "$template_id"
 
   local entry_public_key=""
-  prompt_peer_public_key entry_public_key "入口"
+  while [[ -z "$entry_public_key" ]]; do
+    read -rp "请输入【入口服务器公钥】(入口服务器复制): " entry_public_key
+    [[ -z "$entry_public_key" ]] && print_err "公钥不能为空"
+  done
 
   print_step "WG" "配置出口 WireGuard..."
   configure_exit_wg "$wg_addr" "$entry_wg_ip" "$entry_public_key" "$out_if" "$wg_udp_port"
@@ -1961,7 +1896,10 @@ configure_entry() {
   install_wstunnel
 
   cd "$WG_DIR"
-  prompt_local_wg_keypair "入口" "entry_private.key" "entry_public.key"
+  if [[ ! -f entry_private.key ]]; then
+    umask 077
+    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
+  fi
   local entry_public_key
   entry_public_key="$(cat entry_public.key)"
 
@@ -2018,7 +1956,10 @@ configure_entry() {
   setup_entry_wstunnel_service "$exit_host" "$ws_port" "$path_prefix" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
 
   local exit_public_key=""
-  prompt_peer_public_key exit_public_key "出口"
+  while [[ -z "$exit_public_key" ]]; do
+    read -rp "请输入【出口服务器公钥】(出口服务器复制): " exit_public_key
+    [[ -z "$exit_public_key" ]] && print_err "公钥不能为空"
+  done
 
   print_step "WG" "配置入口 WireGuard..."
   configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
