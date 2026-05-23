@@ -133,7 +133,7 @@ prompt_local_wg_keypair() {
   local private_key
 
   while true; do
-    read -rsp "请输入本机（${role_label}服务器）私钥，回车自动生成: " private_key
+    read -rp "请输入本机（${role_label}服务器）私钥，回车自动生成: " private_key
     echo
 
     if [[ -z "$private_key" ]]; then
