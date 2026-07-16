@@ -2046,7 +2046,7 @@ configure_exit() {
   local exit_public_key
   exit_public_key="$(cat exit_public.key)"
 
-  print_block "【出口服务器公钥（配置入口时填写）】"
+  print_block "【出口服务器私钥（配置入口时填写）】"
   echo "$exit_public_key"
 
   prompt_peer_public_key "入口服务器" "$ENTRY_PEER_PUBLIC_KEY_FILE"
