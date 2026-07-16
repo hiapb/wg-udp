@@ -1641,7 +1641,6 @@ enable_nyanpass_mode() {
 
   ip link set dev "$WG_IF" mtu "$WG_SAFE_MTU" 2>/dev/null || true
   set_mode_flag "nyanpass"
-  print_warn "已建立连接不会自动迁移；请重启 NyanPass 服务或等待连接重新建立"
 }
 
 show_status() {
@@ -2042,7 +2041,7 @@ configure_exit() {
 
   cd "$WG_DIR"
   print_block "🔑 配置出口 WireGuard 身份"
-  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  echo "可选输入自定义密钥；直接回车将自动生成或复用现有密钥"
   ensure_local_wg_identity "exit" "出口服务器"
   local exit_public_key
   exit_public_key="$(cat exit_public.key)"
@@ -2147,7 +2146,7 @@ configure_entry() {
 
   cd "$WG_DIR"
   print_block "🔑 配置入口 WireGuard 身份"
-  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  echo "可选输入自定义密钥；直接回车将自动生成或复用现有密钥"
   ensure_local_wg_identity "entry" "入口服务器"
   local entry_public_key
   entry_public_key="$(cat entry_public.key)"
