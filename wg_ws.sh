@@ -7,6 +7,8 @@ PORT_LIST_FILE="${WG_DIR}/.wg_ports"
 MODE_FILE="${WG_DIR}/.wg_mode"
 EXIT_WG_IP_FILE="${WG_DIR}/.exit_wg_ip"
 ROLE_FILE="${WG_DIR}/.wg_role"
+ENTRY_PEER_PUBLIC_KEY_FILE="${WG_DIR}/.entry_peer_public.key"
+EXIT_PEER_PUBLIC_KEY_FILE="${WG_DIR}/.exit_peer_public.key"
 
 WST_DIR="/etc/wstunnel"
 WSTUNNEL_BIN="/usr/local/bin/wstunnel"
@@ -28,6 +30,8 @@ WG_SAFE_MTU=1320
 WG_SERVER_PORT_DEFAULT=51820
 WST_LOCAL_UDP_PORT_DEFAULT=51820
 ROUTE_TABLE_ID=51820
+NYANPASS_IN_CHAIN="WG_NYAN_IN"
+NYANPASS_OUT_CHAIN="WG_NYAN_OUT"
 
 if [[ $EUID -ne 0 ]]; then
   echo "❌ 请用 root 运行"
@@ -147,6 +151,75 @@ install_wireguard() {
   apt update -y >/dev/null 2>&1 || true
   apt install -y wireguard wireguard-tools >/dev/null 2>&1
   print_ok "WireGuard 安装完成"
+}
+
+ensure_local_wg_identity() {
+  local key_prefix="$1" role_label="$2"
+  local private_file="${WG_DIR}/${key_prefix}_private.key"
+  local public_file="${WG_DIR}/${key_prefix}_public.key"
+  local supplied_private="" private_key="" public_key="" old_public_key=""
+  [[ -s "$public_file" ]] && old_public_key="$(tr -d '\r\n' < "$public_file")"
+
+  while true; do
+    if [[ -s "$private_file" ]]; then
+      read -rsp "自定义${role_label} WireGuard 私钥（可选；回车复用现有）: " supplied_private
+    else
+      read -rsp "自定义${role_label} WireGuard 私钥（可选；回车自动生成）: " supplied_private
+    fi
+    echo
+
+    if [[ -n "$supplied_private" ]]; then
+      private_key="$supplied_private"
+    elif [[ -s "$private_file" ]]; then
+      private_key="$(tr -d '\r\n' < "$private_file")"
+    else
+      private_key="$(wg genkey)"
+    fi
+
+    public_key="$(printf '%s\n' "$private_key" | wg pubkey 2>/dev/null || true)"
+    if [[ "$public_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+      (
+        umask 077
+        printf '%s\n' "$private_key" > "$private_file"
+        printf '%s\n' "$public_key" > "$public_file"
+      )
+      chmod 600 "$private_file" "$public_file"
+      if [[ -n "$old_public_key" && "$old_public_key" != "$public_key" ]]; then
+        print_warn "本机 WireGuard 公钥已改变，必须在对端更新为新公钥"
+      fi
+      return 0
+    fi
+
+    print_err "WireGuard 私钥无效，请重新输入"
+    supplied_private=""
+  done
+}
+
+prompt_peer_public_key() {
+  local peer_label="$1" key_file="$2"
+  local saved_key="" supplied_key="" peer_key=""
+  [[ -s "$key_file" ]] && saved_key="$(tr -d '\r\n' < "$key_file")"
+
+  while true; do
+    if [[ -n "$saved_key" ]]; then
+      read -rp "请输入【${peer_label}公钥】（回车复用已保存公钥）: " supplied_key
+      peer_key="${supplied_key:-$saved_key}"
+    else
+      read -rp "请输入【${peer_label}公钥】: " peer_key
+    fi
+
+    if [[ "$peer_key" =~ ^[A-Za-z0-9+/]{43}=$ ]]; then
+      (
+        umask 077
+        printf '%s\n' "$peer_key" > "$key_file"
+      )
+      chmod 600 "$key_file"
+      return 0
+    fi
+
+    print_err "公钥格式无效，请输入完整的 WireGuard 公钥"
+    supplied_key=""
+  done
 }
 
 install_wstunnel() {
@@ -1229,11 +1302,57 @@ EOF
 }
 
 clear_mark_rules() {
-  for chain in OUTPUT PREROUTING; do
-    iptables -t mangle -S "$chain" 2>/dev/null | (grep " MARK " || true) | sed 's/^-A /-D /' | while read -r line; do
-      [[ -n "$line" ]] && iptables -t mangle $line 2>/dev/null || true
-    done
+  local wan_if p
+  wan_if="$(get_wan_if)"
+
+  # Remove only the exact catch-all marks created by this script's global mode.
+  # Do not enumerate or delete arbitrary MARK rules from other applications.
+  while iptables -t mangle -C OUTPUT -j MARK --set-mark 0x1 2>/dev/null; do
+    iptables -t mangle -D OUTPUT -j MARK --set-mark 0x1 2>/dev/null || true
   done
+  while iptables -t mangle -C PREROUTING -i "$wan_if" -j MARK --set-mark 0x1 2>/dev/null; do
+    iptables -t mangle -D PREROUTING -i "$wan_if" -j MARK --set-mark 0x1 2>/dev/null || true
+  done
+
+  # Port marks are removed only for ports recorded by this script.
+  if [[ -f "$PORT_LIST_FILE" ]]; then
+    while read -r p; do
+      [[ -z "$p" ]] && continue
+      remove_port_iptables_rules "$p"
+    done < "$PORT_LIST_FILE" || true
+  fi
+}
+
+clear_legacy_output_rules() {
+  local remote_port=""
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && remote_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+
+  iptables -t mangle -D OUTPUT -o lo -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --dport 22 -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || true
+  iptables -t mangle -D OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || true
+  if [[ -n "$remote_port" ]]; then
+    iptables -t mangle -D OUTPUT -p tcp --dport "$remote_port" -j RETURN 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p udp --dport "$remote_port" -j RETURN 2>/dev/null || true
+  fi
+  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+}
+
+clear_script_nyanpass_routing_rules() {
+  # WG_NYAN_IN/WG_NYAN_OUT are created by this script for policy routing.
+  # They are separate from all NyanPass-managed listeners and forwarding rules.
+  while iptables -t mangle -C OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null; do
+    iptables -t mangle -D OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
+  done
+  while iptables -t mangle -C PREROUTING -j "$NYANPASS_IN_CHAIN" 2>/dev/null; do
+    iptables -t mangle -D PREROUTING -j "$NYANPASS_IN_CHAIN" 2>/dev/null || true
+  done
+
+  iptables -t mangle -F "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
+  iptables -t mangle -X "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
+  iptables -t mangle -F "$NYANPASS_IN_CHAIN" 2>/dev/null || true
+  iptables -t mangle -X "$NYANPASS_IN_CHAIN" 2>/dev/null || true
 }
 
 get_current_mode() {
@@ -1248,9 +1367,18 @@ set_mode_flag() {
   echo "$1" > "$MODE_FILE"
 }
 
+get_mode_label() {
+  case "${1:-$(get_current_mode)}" in
+    global) echo "全局模式" ;;
+    split) echo "分流模式" ;;
+    nyanpass) echo "NyanPass 转发模式" ;;
+    *) echo "未知模式" ;;
+  esac
+}
+
 ensure_policy_routing_for_ports() {
   ip link show "${WG_IF}" &>/dev/null || return 0
-  if ! ip rule show | (grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}" || true); then
+  if ! ip rule show 2>/dev/null | grep -q "fwmark 0x1 lookup ${ROUTE_TABLE_ID}"; then
     ip rule add fwmark 0x1 lookup ${ROUTE_TABLE_ID}
   fi
   ip route replace default dev "${WG_IF}" table ${ROUTE_TABLE_ID}
@@ -1258,37 +1386,49 @@ ensure_policy_routing_for_ports() {
 }
 
 apply_port_rules_from_file() {
+  local p wst_port=""
   clear_mark_rules
+
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && wst_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+  if [[ -n "$wst_port" ]]; then
+    while iptables -t mangle -C OUTPUT -p tcp --dport "$wst_port" -j RETURN 2>/dev/null; do
+      iptables -t mangle -D OUTPUT -p tcp --dport "$wst_port" -j RETURN 2>/dev/null || true
+    done
+    while iptables -t mangle -C OUTPUT -p udp --dport "$wst_port" -j RETURN 2>/dev/null; do
+      iptables -t mangle -D OUTPUT -p udp --dport "$wst_port" -j RETURN 2>/dev/null || true
+    done
+    iptables -t mangle -A OUTPUT -p tcp --dport "$wst_port" -j RETURN
+    iptables -t mangle -A OUTPUT -p udp --dport "$wst_port" -j RETURN
+  fi
+
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
 
   while read -r p; do
     [[ -z "$p" ]] && continue
+    [[ "$p" == "22" ]] && continue
     iptables -t mangle -C OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p tcp --dport "$p" -j MARK --set-mark 0x1
     iptables -t mangle -C PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1 2>/dev/null || iptables -t mangle -A PREROUTING -p udp --dport "$p" -j MARK --set-mark 0x1
   done < "$PORT_LIST_FILE" || true
-
-  local wst_port=""
-  [[ -f "$WST_REMOTE_PORT_FILE" ]] && wst_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
-  if [[ -n "$wst_port" ]]; then
-    iptables -t mangle -C OUTPUT -p tcp --dport "$wst_port" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p tcp --dport "$wst_port" -j RETURN
-    iptables -t mangle -C OUTPUT -p udp --dport "$wst_port" -j RETURN 2>/dev/null || iptables -t mangle -A OUTPUT -p udp --dport "$wst_port" -j RETURN
-  fi
 }
 
 add_port_to_list() {
   local port="$1"
   mkdir -p "$(dirname "$PORT_LIST_FILE")"
   touch "$PORT_LIST_FILE"
-  (grep -qx "$port" "$PORT_LIST_FILE" || true) && return 0
+  if grep -qx "$port" "$PORT_LIST_FILE"; then
+    return 0
+  fi
   echo "$port" >> "$PORT_LIST_FILE"
 }
 
 remove_port_from_list() {
   local port="$1"
   [[ ! -f "$PORT_LIST_FILE" ]] && return 0
-  (grep -qx "$port" "$PORT_LIST_FILE" || true) || return 0
+  if ! grep -qx "$port" "$PORT_LIST_FILE"; then
+    return 0
+  fi
   sed -i "\|^$port$|d" "$PORT_LIST_FILE"
 }
 
@@ -1339,9 +1479,41 @@ remove_forward_port_mapping() {
   iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -p udp --sport "${port}" -j ACCEPT 2>/dev/null || true
 }
 
+clear_global_forward_rules() {
+  local wan_if exit_ip=""
+  wan_if="$(get_wan_if)"
+  [[ -f "$EXIT_WG_IP_FILE" ]] && exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
+  [[ -z "$exit_ip" ]] && return 0
+
+  iptables -t nat -D PREROUTING -i "$wan_if" -p tcp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
+  iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+  iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+}
+
+clear_split_forward_rules() {
+  local p
+  [[ -f "$PORT_LIST_FILE" ]] || return 0
+  while read -r p; do
+    [[ -z "$p" ]] && continue
+    remove_forward_port_mapping "$p"
+    remove_port_iptables_rules "$p"
+  done < "$PORT_LIST_FILE" || true
+}
+
+clear_script_owned_entry_forward_rules() {
+  # These helpers operate only on exact rules written by this script. They do
+  # not inspect or sweep NyanPass listener/forwarding rules.
+  clear_global_forward_rules
+  clear_split_forward_rules
+}
+
 enable_global_mode() {
+  clear_script_nyanpass_routing_rules
+  clear_script_owned_entry_forward_rules
   ensure_policy_routing_for_ports
   clear_mark_rules
+  clear_legacy_output_rules
 
   local remote_port="" wan_if exit_ip=""
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && remote_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
@@ -1380,24 +1552,23 @@ enable_global_mode() {
 }
 
 enable_split_mode() {
-  local exit_ip wan_if
-  [[ -f "$EXIT_WG_IP_FILE" ]] && exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
-  wan_if="$(get_wan_if)"
-
-  if [[ -n "${exit_ip:-}" ]]; then
-    iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
-    iptables -t nat -D PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
-    iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-  fi
+  local p
+  clear_script_nyanpass_routing_rules
+  clear_script_owned_entry_forward_rules
 
   ensure_policy_routing_for_ports
   clear_mark_rules
+  clear_legacy_output_rules
   apply_port_rules_from_file
 
   if [[ -f "$PORT_LIST_FILE" ]]; then
     while read -r p; do
       [[ -z "$p" ]] && continue
+      if [[ "$p" == "22" ]]; then
+        remove_forward_port_mapping "$p"
+        remove_port_iptables_rules "$p"
+        continue
+      fi
       add_forward_port_mapping "$p"
     done < "$PORT_LIST_FILE" || true
   fi
@@ -1406,10 +1577,77 @@ enable_split_mode() {
   set_mode_flag "split"
 }
 
+enable_nyanpass_mode() {
+  local wan_if remote_host="" remote_ip remote_port="" dns_ip
+  local -a remote_ips=()
+  wan_if="$(get_wan_if)"
+  [[ -f "$WST_REMOTE_HOST_FILE" ]] && remote_host="$(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
+  [[ -f "$WST_REMOTE_PORT_FILE" ]] && remote_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
+
+  if [[ -z "$remote_host" || -z "$remote_port" ]]; then
+    print_err "WSS 远端地址或端口未配置，无法启用 NyanPass 转发模式"
+    return 1
+  fi
+  while read -r remote_ip; do
+    [[ -n "$remote_ip" ]] && remote_ips+=("$remote_ip")
+  done < <(getent ahostsv4 "$remote_host" 2>/dev/null | awk '!seen[$1]++ {print $1}')
+  if [[ ${#remote_ips[@]} -eq 0 ]]; then
+    print_err "无法解析 WSS 远端 IPv4: $remote_host"
+    return 1
+  fi
+
+  # NyanPass must receive public inbound connections locally, so remove all
+  # catch-all and per-port DNAT rules left by the other entry modes.
+  clear_script_owned_entry_forward_rules
+
+  clear_mark_rules
+  clear_legacy_output_rules
+  clear_script_nyanpass_routing_rules
+  ensure_policy_routing_for_ports
+  ensure_server_bypass_route
+
+  iptables -t mangle -N "$NYANPASS_IN_CHAIN" 2>/dev/null || true
+  iptables -t mangle -N "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
+  iptables -t mangle -F "$NYANPASS_IN_CHAIN"
+  iptables -t mangle -F "$NYANPASS_OUT_CHAIN"
+
+  # Mark public inbound connections so their replies keep using the entry WAN.
+  iptables -t mangle -A "$NYANPASS_IN_CHAIN" -i "$wan_if" -m addrtype --dst-type LOCAL -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x2
+
+  # WSS is the carrier for wg0 and must never be routed back into wg0.
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -o lo -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --sport 22 -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --dport 22 -j RETURN
+  for remote_ip in "${remote_ips[@]}"; do
+    iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -d "${remote_ip}/32" -p tcp --dport "$remote_port" -j RETURN
+  done
+  while read -r dns_ip; do
+    [[ "$dns_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || continue
+    iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -d "${dns_ip}/32" -p udp --dport 53 -j RETURN
+    iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -d "${dns_ip}/32" -p tcp --dport 53 -j RETURN
+  done < <(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null | sort -u)
+
+  # Restore established connection paths. New local connections use mark 0x1
+  # and table 51820, while inbound replies retain mark 0x2 and use main routing.
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -j CONNMARK --restore-mark
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark 0x2 -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark 0x1 -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m conntrack --ctstate NEW -j MARK --set-mark 0x1
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark 0x1 -j CONNMARK --save-mark
+
+  iptables -t mangle -C PREROUTING -j "$NYANPASS_IN_CHAIN" 2>/dev/null || iptables -t mangle -I PREROUTING 1 -j "$NYANPASS_IN_CHAIN"
+  iptables -t mangle -C OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null || iptables -t mangle -I OUTPUT 1 -j "$NYANPASS_OUT_CHAIN"
+
+  ip link set dev "$WG_IF" mtu "$WG_SAFE_MTU" 2>/dev/null || true
+  set_mode_flag "nyanpass"
+  print_warn "已建立连接不会自动迁移；请重启 NyanPass 服务或等待连接重新建立"
+}
+
 show_status() {
   print_block "📊 当前链路状态"
   echo "角色: $(get_role)"
-  echo "模式: $(get_current_mode)"
+  echo "模式: $(get_mode_label)"
   [[ -f "$WST_REMOTE_HOST_FILE" ]] && echo "远端主机: $(cat "$WST_REMOTE_HOST_FILE" 2>/dev/null || true)"
   [[ -f "$WST_REMOTE_PORT_FILE" ]] && echo "远端端口: $(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
   [[ -f "$WST_PATH_FILE" ]] && echo "路径前缀: $(cat "$WST_PATH_FILE" 2>/dev/null || true)"
@@ -1428,7 +1666,11 @@ show_status() {
 
 manage_entry_ports() {
   [[ "$(get_role)" == "entry" ]] || { print_err "当前机器不是入口服务器"; return 1; }
-  ensure_policy_routing_for_ports
+  local mode
+  mode="$(get_current_mode)"
+  if [[ "$mode" == "split" ]]; then
+    ensure_policy_routing_for_ports
+  fi
 
   while true; do
     print_block "入口端口分流管理"
@@ -1450,9 +1692,13 @@ manage_entry_ports() {
         read -rp "端口: " new_port
         if [[ "$new_port" =~ ^[0-9]+$ ]] && [[ "$new_port" -ge 1 ]] && [[ "$new_port" -le 65535 ]] && [[ "$new_port" -ne 22 ]]; then
           add_port_to_list "$new_port"
-          apply_port_rules_from_file
-          add_forward_port_mapping "$new_port"
-          print_ok "已添加端口: $new_port"
+          if [[ "$mode" == "split" ]]; then
+            apply_port_rules_from_file
+            add_forward_port_mapping "$new_port"
+            print_ok "已添加并应用端口: $new_port"
+          else
+            print_ok "已保存分流端口: $new_port"
+          fi
         else
           print_err "端口不合法"
         fi
@@ -1461,9 +1707,13 @@ manage_entry_ports() {
         read -rp "要删除的端口: " del_port
         if [[ "$del_port" =~ ^[0-9]+$ ]]; then
           remove_port_from_list "$del_port"
-          remove_port_iptables_rules "$del_port"
-          remove_forward_port_mapping "$del_port"
-          print_ok "已删除端口: $del_port"
+          if [[ "$mode" == "split" ]]; then
+            remove_port_iptables_rules "$del_port"
+            remove_forward_port_mapping "$del_port"
+            print_ok "已删除并撤销端口: $del_port"
+          else
+            print_ok "已删除分流端口: $del_port"
+          fi
         else
           print_err "端口不合法"
         fi
@@ -1481,15 +1731,17 @@ manage_entry_mode() {
     local mode
     mode="$(get_current_mode)"
     print_block "入口模式管理"
-    echo "当前模式: ${mode}"
+    echo "当前模式: $(get_mode_label "$mode")"
     echo "1) 切换为 全局模式"
     echo "2) 切换为 分流模式"
+    echo "3) 切换为 NyanPass 转发模式"
     echo "0) 返回上一级"
     read -rp "请选择: " sub
 
     case "$sub" in
       1) enable_global_mode; print_ok "已切换为全局模式" ;;
       2) enable_split_mode; print_ok "已切换为分流模式" ;;
+      3) enable_nyanpass_mode; print_ok "已切换为 NyanPass 转发模式" ;;
       0) break ;;
       *) print_err "无效选择" ;;
     esac
@@ -1515,11 +1767,11 @@ start_wg() {
     ensure_server_bypass_route
     local mode
     mode="$(get_current_mode)"
-    if [[ "$mode" == "global" ]]; then
-      enable_global_mode
-    else
-      enable_split_mode
-    fi
+    case "$mode" in
+      global) enable_global_mode ;;
+      nyanpass) enable_nyanpass_mode ;;
+      *) enable_split_mode ;;
+    esac
     print_ok "入口已启动"
   else
     print_err "还未配置角色"
@@ -1538,6 +1790,9 @@ stop_wg() {
     systemctl stop wstunnel-entry.service 2>/dev/null || true
   fi
 
+  clear_script_nyanpass_routing_rules
+  clear_script_owned_entry_forward_rules
+  clear_legacy_output_rules
   wg-quick down "${WG_IF}" 2>/dev/null || true
   ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
   clear_mark_rules
@@ -1786,17 +2041,18 @@ configure_exit() {
   install_wstunnel
 
   cd "$WG_DIR"
-  if [[ ! -f exit_private.key ]]; then
-    (
-      umask 077
-      wg genkey | tee exit_private.key | wg pubkey > exit_public.key
-    )
-  fi
+  print_block "🔑 配置出口 WireGuard 身份"
+  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  ensure_local_wg_identity "exit" "出口服务器"
   local exit_public_key
   exit_public_key="$(cat exit_public.key)"
 
-  print_block "【本机（出口服务器）公钥】"
+  print_block "【出口服务器公钥（配置入口时填写）】"
   echo "$exit_public_key"
+
+  prompt_peer_public_key "入口服务器" "$ENTRY_PEER_PUBLIC_KEY_FILE"
+  local entry_public_key
+  entry_public_key="$(cat "$ENTRY_PEER_PUBLIC_KEY_FILE")"
 
   local domain=""
   while true; do
@@ -1863,12 +2119,6 @@ configure_exit() {
   print_step "站点" "写入 HTTPS + wstunnel 反代配置..."
   write_nginx_https_wstunnel_site "$domain" "$backend_port" "$path_prefix" "$ws_port" "$template_id"
 
-  local entry_public_key=""
-  while [[ -z "$entry_public_key" ]]; do
-    read -rp "请输入【入口服务器公钥】(入口服务器复制): " entry_public_key
-    [[ -z "$entry_public_key" ]] && print_err "公钥不能为空"
-  done
-
   print_step "WG" "配置出口 WireGuard..."
   configure_exit_wg "$wg_addr" "$entry_wg_ip" "$entry_public_key" "$out_if" "$wg_udp_port"
 
@@ -1896,15 +2146,18 @@ configure_entry() {
   install_wstunnel
 
   cd "$WG_DIR"
-  if [[ ! -f entry_private.key ]]; then
-    umask 077
-    wg genkey | tee entry_private.key | wg pubkey > entry_public.key
-  fi
+  print_block "🔑 配置入口 WireGuard 身份"
+  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  ensure_local_wg_identity "entry" "入口服务器"
   local entry_public_key
   entry_public_key="$(cat entry_public.key)"
 
-  print_block "【本机（入口服务器）公钥】"
+  print_block "【入口服务器公钥（配置出口时填写）】"
   echo "$entry_public_key"
+
+  prompt_peer_public_key "出口服务器" "$EXIT_PEER_PUBLIC_KEY_FILE"
+  local exit_public_key
+  exit_public_key="$(cat "$EXIT_PEER_PUBLIC_KEY_FILE")"
 
   local wg_addr exit_wg_ip ws_port verify_tls local_udp_port remote_wg_udp_port
   local saved_host="" saved_port="" saved_path="" saved_verify=""
@@ -1955,12 +2208,6 @@ configure_entry() {
   save_wst_params "$exit_host" "$ws_port" "$path_prefix" "$verify_tls"
   setup_entry_wstunnel_service "$exit_host" "$ws_port" "$path_prefix" "$verify_tls" "$local_udp_port" "$remote_wg_udp_port"
 
-  local exit_public_key=""
-  while [[ -z "$exit_public_key" ]]; do
-    read -rp "请输入【出口服务器公钥】(出口服务器复制): " exit_public_key
-    [[ -z "$exit_public_key" ]] && print_err "公钥不能为空"
-  done
-
   print_step "WG" "配置入口 WireGuard..."
   configure_entry_wg "$wg_addr" "$exit_wg_ip" "$exit_public_key" "$local_udp_port"
   ensure_server_bypass_route
@@ -1975,53 +2222,17 @@ configure_entry() {
 }
 
 pre_uninstall_cleanup() {
-  local wan_if exit_ip remote_port
-  wan_if="$(get_wan_if)"
-  exit_ip=""
-  remote_port=""
-
-  [[ -f "$EXIT_WG_IP_FILE" ]] && exit_ip="$(cat "$EXIT_WG_IP_FILE" 2>/dev/null || true)"
-  [[ -f "$WST_REMOTE_PORT_FILE" ]] && remote_port="$(cat "$WST_REMOTE_PORT_FILE" 2>/dev/null || true)"
-
-  print_step "预清理-1" "撤销全局模式遗留规则..."
-
-  if [[ -n "$exit_ip" ]]; then
-    iptables -t nat -D PREROUTING -i "${wan_if}" -p tcp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
-    iptables -t nat -D PREROUTING -i "${wan_if}" -p udp ! --dport 22 -j DNAT --to-destination "${exit_ip}" 2>/dev/null || true
-    iptables -D FORWARD -i "${wan_if}" -o "${WG_IF}" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "${WG_IF}" -o "${wan_if}" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D POSTROUTING -o "${WG_IF}" -j MASQUERADE 2>/dev/null || true
-  fi
-
-  iptables -t mangle -D OUTPUT -o lo -j RETURN 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p tcp --sport 22 -j RETURN 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p tcp --dport 22 -j RETURN 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p udp --dport 53 -j RETURN 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -p tcp --dport 53 -j RETURN 2>/dev/null || true
-
-  if [[ -n "$remote_port" ]]; then
-    iptables -t mangle -D OUTPUT -p tcp --dport "${remote_port}" -j RETURN 2>/dev/null || true
-    iptables -t mangle -D OUTPUT -p udp --dport "${remote_port}" -j RETURN 2>/dev/null || true
-  fi
-
-  iptables -t mangle -D OUTPUT -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
-  iptables -t mangle -D OUTPUT -j MARK --set-mark 0x1 2>/dev/null || true
-  iptables -t mangle -D PREROUTING -i "${wan_if}" -j MARK --set-mark 0x1 2>/dev/null || true
-  print_ok "全局模式遗留规则已尝试撤销"
-
-  print_step "预清理-2" "撤销分流模式遗留规则..."
+  print_step "预清理-1" "撤销本脚本创建的入口规则..."
+  clear_script_nyanpass_routing_rules 2>/dev/null || true
+  clear_script_owned_entry_forward_rules 2>/dev/null || true
   clear_mark_rules 2>/dev/null || true
+  clear_legacy_output_rules 2>/dev/null || true
+  while iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || true
+  done
+  print_ok "本脚本的入口规则已撤销"
 
-  if [[ -f "$PORT_LIST_FILE" ]]; then
-    while read -r p; do
-      [[ -z "$p" ]] && continue
-      remove_forward_port_mapping "$p" 2>/dev/null || true
-      remove_port_iptables_rules "$p" 2>/dev/null || true
-    done < "$PORT_LIST_FILE"
-  fi
-  print_ok "分流模式遗留规则已尝试撤销"
-
-  print_step "预清理-3" "清理策略路由..."
+  print_step "预清理-2" "清理本脚本的策略路由..."
   ip route flush table ${ROUTE_TABLE_ID} 2>/dev/null || true
   ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true
   print_ok "策略路由已清理"
@@ -2058,30 +2269,15 @@ uninstall_wg() {
   ip rule del fwmark 0x1 lookup ${ROUTE_TABLE_ID} 2>/dev/null || true
   print_ok "策略路由已清理"
 
-  print_step "4/10" "清理 mangle / nat / forward 规则..."
+  print_step "4/10" "清理本脚本的 mangle / nat / forward 规则..."
+  clear_script_nyanpass_routing_rules 2>/dev/null || true
+  clear_script_owned_entry_forward_rules 2>/dev/null || true
+  clear_legacy_output_rules 2>/dev/null || true
   clear_mark_rules 2>/dev/null || true
-
-  if [[ -f "$PORT_LIST_FILE" ]]; then
-    while read -r p; do
-      [[ -z "$p" ]] && continue
-      echo "  - 清理端口规则: $p"
-      remove_forward_port_mapping "$p" 2>/dev/null || true
-      remove_port_iptables_rules "$p" 2>/dev/null || true
-    done < "$PORT_LIST_FILE"
-  fi
-
-  iptables -t nat -S PREROUTING 2>/dev/null | grep -E "DNAT|${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
-    iptables -t nat $line 2>/dev/null || true
+  while iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || true
   done
-
-  iptables -t nat -S POSTROUTING 2>/dev/null | grep -E "${WG_IF}|MASQUERADE" | sed 's/^-A /-D /' | while read -r line; do
-    iptables -t nat $line 2>/dev/null || true
-  done
-
-  iptables -S FORWARD 2>/dev/null | grep -E "${WG_IF}" | sed 's/^-A /-D /' | while read -r line; do
-    iptables $line 2>/dev/null || true
-  done
-  print_ok "iptables 规则已清理"
+  print_ok "本脚本 iptables 规则已清理"
 
   print_step "5/10" "删除 wstunnel 二进制与配置目录..."
   rm -f "$WSTUNNEL_BIN"
@@ -2166,7 +2362,7 @@ while true; do
   echo "6) 重启"
   echo "7) 卸载并清理"
   echo "8) 管理入口端口分流"
-  echo "9) 管理入口模式（全局 / 分流）"
+  echo "9) 管理入口模式"
   echo "10) 修改出口 IP / 域名（仅入口使用）"
   echo "11) 出口高级管理 (证书 / 域名切换 / 伪装库)"
   echo "0) 退出"
