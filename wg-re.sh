@@ -132,7 +132,10 @@ select_reality_target() {
   REALITY_PROMPT_DEST=""
 
   while true; do
-    read -rp "Reality 伪装目标使用脚本推荐还是自己填写？[1=脚本推荐，2=自己填写，默认 1]: " source
+    echo
+    echo "1) 使用脚本推荐"
+    echo "2) 自定义填写"
+    read -rp "请选择 [1-2，默认 1]: " source
     source="${source:-1}"
     case "$source" in
       1) break ;;
@@ -155,26 +158,15 @@ select_reality_target() {
   echo "2) www.nvidia.com     (NVIDIA 官网)"
   echo "3) www.amd.com        (AMD 官网)"
   echo "4) www.speedtest.net  (全球测速网)"
-  echo "5) 手动填写 SNI 和目标"
   while true; do
-    read -rp "请选择 [1-5，回车默认 1]: " choice
+    read -rp "请选择 [1-4，回车默认 1]: " choice
     choice="${choice:-1}"
     case "$choice" in
       1) REALITY_PROMPT_SNI="$DEFAULT_REALITY_SNI"; REALITY_PROMPT_DEST="$DEFAULT_REALITY_DEST"; return 0 ;;
       2) REALITY_PROMPT_SNI="www.nvidia.com"; REALITY_PROMPT_DEST="www.nvidia.com:443"; return 0 ;;
       3) REALITY_PROMPT_SNI="www.amd.com"; REALITY_PROMPT_DEST="www.amd.com:443"; return 0 ;;
       4) REALITY_PROMPT_SNI="www.speedtest.net"; REALITY_PROMPT_DEST="www.speedtest.net:443"; return 0 ;;
-      5)
-        read -rp "自定义 Reality SNI: " custom_sni
-        read -rp "自定义 Reality 目标 (host:port): " custom_dest
-        if valid_host "$custom_sni" && valid_reality_dest "$custom_dest"; then
-          REALITY_PROMPT_SNI="$custom_sni"
-          REALITY_PROMPT_DEST="$custom_dest"
-          return 0
-        fi
-        print_err "SNI 或目标格式无效，请重新填写"
-        ;;
-      *) print_err "请选择 1-5" ;;
+      *) print_err "请选择 1-4" ;;
     esac
   done
 }
@@ -545,11 +537,11 @@ ensure_local_wg_identity() {
   old_public="$(read_value "$WG_PUBLIC_KEY_FILE")"
   while true; do
     if [[ -s "$WG_PRIVATE_KEY_FILE" ]]; then
-      read -rsp "自定义${role_label} WireGuard 私钥（可选；回车复用现有）: " supplied_private
+      read -rp "自定义${role_label} WireGuard 私钥（回车复用现有）: " supplied_private
     else
-      read -rsp "自定义${role_label} WireGuard 私钥（可选；回车自动生成）: " supplied_private
+      read -rp "自定义${role_label} WireGuard 私钥（回车自动生成）: " supplied_private
     fi
-    echo
+    supplied_private="${supplied_private//[[:space:]]/}"
     if [[ -n "$supplied_private" ]]; then
       private_key="$supplied_private"
     elif [[ -s "$WG_PRIVATE_KEY_FILE" ]]; then
