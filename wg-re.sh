@@ -721,11 +721,14 @@ stop_wg() {
   fi
   clear_script_nyanpass_routing_rules
   clear_script_owned_entry_forward_rules
+  clear_mangle_chains
   clear_legacy_output_rules
   clear_host_firewall
+  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
   wg-quick down "$WG_IF" 2>/dev/null || true
+  clear_wg_runtime_rules
   ip route flush table "$ROUTE_TABLE_ID" 2>/dev/null || true
-  ip rule del fwmark "$FW_MARK" table "$ROUTE_TABLE_ID" 2>/dev/null || true
+  clear_fw_policy_rules
   clear_carrier_policy_rule
   print_ok "已停止"
 }
@@ -845,6 +848,41 @@ clear_entry_forward_rules() {
   iptables -t nat -D PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
   iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+}
+
+clear_fw_policy_rules() {
+  while fw_policy_rule_exists; do
+    ip rule del fwmark "$FW_MARK" table "$ROUTE_TABLE_ID" 2>/dev/null || break
+  done
+}
+
+clear_wg_runtime_rules() {
+  local current_role wan_if peer_address peer_network
+  current_role="$(role)"
+
+  if [[ "$current_role" == entry ]]; then
+    while iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null; do
+      iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || break
+    done
+    return 0
+  fi
+
+  [[ "$current_role" == exit ]] || return 0
+  wan_if="$(read_value "$WAN_IF_FILE")"
+  peer_address="$(read_value "$PEER_ADDRESS_FILE")"
+  [[ -n "$wan_if" && -n "$peer_address" ]] || return 0
+  peer_network="$(network_cidr "$peer_address")"
+
+  while iptables -C FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do
+    iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || break
+  done
+  while iptables -C FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do
+    iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || break
+  done
+  while iptables -t nat -C POSTROUTING -s "$peer_network" -o "$wan_if" -j MASQUERADE 2>/dev/null; do
+    iptables -t nat -D POSTROUTING -s "$peer_network" -o "$wan_if" -j MASQUERADE 2>/dev/null || break
+  done
+  iptables -t mangle -D FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
 }
 
 apply_entry_forward_rules() {
@@ -1364,25 +1402,38 @@ start_all() {
 stop_all() {
   systemctl stop "$XRAY_ENTRY_SERVICE" "$XRAY_EXIT_SERVICE" 2>/dev/null || true
   stop_wg
+  clear_script_nyanpass_routing_rules
   clear_entry_forward_rules
   clear_mangle_chains
+  clear_host_firewall
+  clear_wg_runtime_rules
   ip route flush table "$ROUTE_TABLE_ID" 2>/dev/null || true
-  ip rule del fwmark "$FW_MARK" table "$ROUTE_TABLE_ID" 2>/dev/null || true
+  clear_fw_policy_rules
+  clear_carrier_policy_rule
   ok '服务已停止'
 }
 
 uninstall_all() {
-  local remove_xray='n' managed_sysctl xray_was_managed='n'
+  local remove_xray='n' managed_sysctl xray_was_managed='n' wg_config_owned='n'
   print_block '卸载 wg-reality'
   printf '确认卸载并删除本脚本配置？[y/N]: '
   local answer; IFS= read -r answer || true
   [[ "$answer" =~ ^[Yy]$ ]] || { info '已取消'; return 0; }
   [[ -f "$XRAY_MANAGED_FILE" ]] && xray_was_managed='y'
+  [[ -f "$WG_MARKER" ]] && wg_config_owned='y'
+
+  set +e
   stop_all
+  systemctl stop "wg-quick@${WG_IF}.service" 2>/dev/null || true
+  systemctl disable "wg-quick@${WG_IF}.service" 2>/dev/null || true
   systemctl disable "$XRAY_ENTRY_SERVICE" "$XRAY_EXIT_SERVICE" 2>/dev/null || true
   rm -f "/etc/systemd/system/${XRAY_ENTRY_SERVICE}" "/etc/systemd/system/${XRAY_EXIT_SERVICE}"
-  systemctl daemon-reload
-  rm -f "$WG_CONFIG" "$WG_MARKER"
+  systemctl daemon-reload 2>/dev/null || true
+  if [[ "$wg_config_owned" == y ]]; then
+    rm -f "$WG_CONFIG" "$WG_MARKER"
+  elif [[ -e "$WG_CONFIG" ]]; then
+    warn "${WG_CONFIG} 没有本脚本管理标记，已保留"
+  fi
   rm -rf "$BASE_DIR" "$XRAY_DIR"
   [[ "$xray_was_managed" == y ]] && remove_xray='y'
   [[ "$remove_xray" == y ]] && rm -f "$XRAY_BIN"
@@ -1391,6 +1442,7 @@ uninstall_all() {
     sed -i "/# ${APP_NAME}/,+1d" /etc/sysctl.conf 2>/dev/null || true
     sysctl -p >/dev/null 2>&1 || true
   fi
+  set -e
   ok '已卸载本脚本创建的服务、WireGuard 配置、Xray 配置和防火墙规则'
 }
 
