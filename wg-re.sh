@@ -845,7 +845,6 @@ clear_entry_forward_rules() {
   iptables -t nat -D PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
   iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
   iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-  iptables -t nat -D POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || true
 }
 
 apply_entry_forward_rules() {
@@ -891,6 +890,8 @@ ensure_policy_route() {
     fw_policy_rule_exists || { err 'WireGuard 策略路由规则创建失败'; return 1; }
   fi
   ip route replace default dev "$WG_IF" table "$ROUTE_TABLE_ID"
+  iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || \
+    iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
 }
 
 apply_routing_mode() {
@@ -1095,7 +1096,7 @@ configure_exit() {
   install_xray
 
   print_block "🔑 配置出口 WireGuard 身份"
-  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  echo "回车将自动生成或复用现有私钥"
   ensure_local_wg_identity "出口服务器"
   local exit_public_key entry_public_key
   exit_public_key="$(read_value "$WG_PUBLIC_KEY_FILE")"
@@ -1171,7 +1172,7 @@ configure_exit() {
   echo "出口地址: ${host}"
   echo "Reality端口: ${port}"
   echo "SNI: ${sni}"
-  echo "公钥: $(read_value "$REALITY_PUBLIC_KEY_FILE")"
+  echo "reality公钥: $(read_value "$REALITY_PUBLIC_KEY_FILE")"
   echo "UUID: $(read_value "$UUID_FILE")"
   echo "Short ID: $(read_value "$SHORT_ID_FILE")"
   echo "出口WG公钥: ${exit_public_key}"
@@ -1186,7 +1187,7 @@ configure_entry() {
   install_xray
 
   print_block "🔑 配置入口 WireGuard 身份"
-  echo "可选输入自定义私钥；直接回车将自动生成或复用现有私钥"
+  echo "回车将自动生成或复用现有私钥"
   ensure_local_wg_identity "入口服务器"
   local entry_public_key exit_public_key
   entry_public_key="$(read_value "$WG_PUBLIC_KEY_FILE")"
@@ -1303,6 +1304,19 @@ show_health_summary() {
     echo "  ⚠️  ss 未显示 UDP ${port}，但 WireGuard 存在近期有效握手"
   else
     echo "  ❌ 期望端口 ${port:-未配置}: 未监听"
+  fi
+
+  if [[ "$current_role" == entry ]]; then
+    if fw_policy_rule_exists && ip route show table "$ROUTE_TABLE_ID" 2>/dev/null | grep -Eq "^default .*dev ${WG_IF}([[:space:]]|$)"; then
+      echo "  ✅ WireGuard 策略路由: 正常"
+    else
+      echo "  ❌ WireGuard 策略路由: 缺失"
+    fi
+    if iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null; then
+      echo "  ✅ WireGuard 出口 NAT: 正常"
+    else
+      echo "  ❌ WireGuard 出口 NAT: 缺失"
+    fi
   fi
 
   if [[ "$handshake" =~ ^[0-9]+$ ]] && ((handshake > 0)); then
