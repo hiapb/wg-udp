@@ -42,14 +42,17 @@ WG_LOCAL_PORT_FILE="${STATE_DIR}/wg_local_port"
 WG_ADDRESS_FILE="${STATE_DIR}/wg_address"
 PEER_ADDRESS_FILE="${STATE_DIR}/peer_address"
 WAN_IF_FILE="${STATE_DIR}/wan_if"
+SSH_PORTS_FILE="${STATE_DIR}/ssh_ports"
 
 XRAY_ENTRY_SERVICE="wg-reality-entry.service"
 XRAY_EXIT_SERVICE="wg-reality-exit.service"
 ROUTE_TABLE_ID="51820"
 FW_MARK="0x1"
+LOCAL_CONN_MARK="0x2"
 CARRIER_MARK="0x66"
 CARRIER_MARK_DEC="102"
 CARRIER_RULE_PRIORITY="100"
+WAN_BIND_RULE_PRIORITY="90"
 MANGLE_OUT_CHAIN="WGR_OUT"
 MANGLE_PRE_CHAIN="WGR_PRE"
 NYANPASS_IN_CHAIN="WG_NYAN_IN"
@@ -222,6 +225,62 @@ get_gateway() {
   ip route get 1.1.1.1 2>/dev/null | awk '{for (i=1;i<=NF;i++) if ($i=="via") {print $(i+1); exit}}' || true
 }
 
+detect_ssh_ports() {
+  {
+    # The current SSH session is the strongest signal when switching modes
+    # remotely, especially with Match blocks or socket-activated sshd.
+    printf '%s\n' "${SSH_CONNECTION:-}" | awk 'NF >= 4 {print $4}'
+    if command -v ss >/dev/null 2>&1; then
+      ss -H -ltnp 2>/dev/null | awk '
+        /users:\(\("sshd"/ {
+          address = $4
+          sub(/^.*:/, "", address)
+          print address
+        }
+      ' || true
+    fi
+    if command -v sshd >/dev/null 2>&1; then
+      sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+    elif [[ -x /usr/sbin/sshd ]]; then
+      /usr/sbin/sshd -T 2>/dev/null | awk '$1 == "port" {print $2}' || true
+    fi
+    # Keep the standard port local as a recovery path even when sshd is
+    # currently configured on a custom port.
+    printf '22\n'
+  } | awk '
+    /^[0-9]+$/ && $1 >= 1 && $1 <= 65535 && !seen[$1]++ {
+      print $1
+      count++
+      if (count == 15) exit
+    }
+  '
+}
+
+detect_ssh_ports_csv() {
+  local ports
+  ports="$(detect_ssh_ports | paste -sd, -)"
+  printf '%s\n' "${ports:-22}"
+}
+
+refresh_ssh_ports() {
+  local ports
+  ports="$(detect_ssh_ports_csv)"
+  write_value "$SSH_PORTS_FILE" "$ports"
+  printf '%s\n' "$ports"
+}
+
+protected_ssh_ports_csv() {
+  local ports
+  ports="$(read_value "$SSH_PORTS_FILE")"
+  printf '%s\n' "${ports:-22}"
+}
+
+is_protected_ssh_port() {
+  local port="$1" ports
+  ports=",$(protected_ssh_ports_csv),"
+  [[ "$ports" == *",${port},"* ]]
+}
+
 resolve_ipv4s() {
   local host="$1"
   if [[ "$host" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
@@ -262,6 +321,49 @@ carrier_policy_rule_exists() {
 
 fw_policy_rule_exists() {
   policy_rule_exists "$FW_MARK" "$ROUTE_TABLE_ID"
+}
+
+wan_bind_policy_rule_exists() {
+  local wan_if="$1"
+  ip rule show 2>/dev/null | awk \
+    -v wanted_priority="$WAN_BIND_RULE_PRIORITY" \
+    -v wanted_if="$wan_if" '
+      {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (priority != wanted_priority) next
+        oif_ok = 0
+        table_ok = 0
+        for (i = 1; i <= NF; i++) {
+          if ($i == "oif" && i < NF && $(i + 1) == wanted_if) oif_ok = 1
+          if (($i == "lookup" || $i == "table") && i < NF && $(i + 1) == "main") table_ok = 1
+        }
+        if (oif_ok && table_ok) found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
+ensure_wan_bind_policy_rule() {
+  local wan_if
+  wan_if="$(read_value "$WAN_IF_FILE")"
+  [[ -n "$wan_if" ]] || return 0
+  wan_bind_policy_rule_exists "$wan_if" && return 0
+  if ip rule show 2>/dev/null | awk -v wanted="${WAN_BIND_RULE_PRIORITY}:" '$1 == wanted {found = 1} END {exit(found ? 0 : 1)}'; then
+    err "ip rule 优先级 ${WAN_BIND_RULE_PRIORITY} 已被其他规则占用，无法建立显式 WAN 直连旁路"
+    return 1
+  fi
+  ip rule add priority "$WAN_BIND_RULE_PRIORITY" oif "$wan_if" table main 2>/dev/null || true
+  wan_bind_policy_rule_exists "$wan_if" || { err '显式 WAN 直连旁路创建失败'; return 1; }
+}
+
+clear_wan_bind_policy_rule() {
+  local wan_if
+  wan_if="$(read_value "$WAN_IF_FILE")"
+  [[ -n "$wan_if" ]] || return 0
+  while wan_bind_policy_rule_exists "$wan_if"; do
+    ip rule del priority "$WAN_BIND_RULE_PRIORITY" oif "$wan_if" table main 2>/dev/null || break
+  done
 }
 
 ensure_carrier_policy_rule() {
@@ -547,19 +649,20 @@ write_exit_wg_config() {
 }
 
 write_entry_wg_config() {
-  local entry_addr exit_addr exit_pub local_port private
+  local entry_addr exit_addr exit_pub local_port private wan_if
   entry_addr="$(read_value "$WG_ADDRESS_FILE")"
   exit_addr="$(read_value "$PEER_ADDRESS_FILE")"
   exit_pub="$(read_value "$PEER_PUBLIC_KEY_FILE")"
   local_port="$(read_value "$WG_LOCAL_PORT_FILE")"
   private="$(read_value "$WG_PRIVATE_KEY_FILE")"
+  wan_if="$(read_value "$WAN_IF_FILE")"
 
   ensure_wg_conf_is_owned
   {
     printf '[Interface]\nAddress = %s\nPrivateKey = %s\nTable = off\nMTU = 1280\n' "$entry_addr" "$private"
-    printf 'PostUp = ip rule add priority %s fwmark %s table main 2>/dev/null || true; ip rule add fwmark %s table %s 2>/dev/null || true; ip route replace default dev %s table %s; ip route replace %s dev %s table %s; ' "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$WG_IF" "$ROUTE_TABLE_ID" "${exit_addr%%/*}" "$WG_IF" "$ROUTE_TABLE_ID"
+    printf 'PostUp = ip rule add priority %s oif %s table main 2>/dev/null || true; ip rule add priority %s fwmark %s table main 2>/dev/null || true; ip rule add fwmark %s table %s 2>/dev/null || true; ip route replace default dev %s table %s; ip route replace %s dev %s table %s; ' "$WAN_BIND_RULE_PRIORITY" "$wan_if" "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$WG_IF" "$ROUTE_TABLE_ID" "${exit_addr%%/*}" "$WG_IF" "$ROUTE_TABLE_ID"
     printf 'iptables -t nat -C POSTROUTING -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %s -j MASQUERADE\n' "$WG_IF" "$WG_IF"
-    printf 'PostDown = ip rule del priority %s fwmark %s table main 2>/dev/null || true; ip rule del fwmark %s table %s 2>/dev/null || true; ip route flush table %s 2>/dev/null || true; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE 2>/dev/null || true\n' "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$ROUTE_TABLE_ID" "$WG_IF"
+    printf 'PostDown = ip rule del priority %s oif %s table main 2>/dev/null || true; ip rule del priority %s fwmark %s table main 2>/dev/null || true; ip rule del fwmark %s table %s 2>/dev/null || true; ip route flush table %s 2>/dev/null || true; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE 2>/dev/null || true\n' "$WAN_BIND_RULE_PRIORITY" "$wan_if" "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$ROUTE_TABLE_ID" "$WG_IF"
     printf '\n[Peer]\nPublicKey = %s\nEndpoint = 127.0.0.1:%s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 20\n' "$exit_pub" "$local_port"
   } > "$WG_CONFIG"
   chmod 600 "$WG_CONFIG"
@@ -730,6 +833,7 @@ stop_wg() {
   ip route flush table "$ROUTE_TABLE_ID" 2>/dev/null || true
   clear_fw_policy_rules
   clear_carrier_policy_rule
+  clear_wan_bind_policy_rule
   print_ok "已停止"
 }
 
@@ -825,7 +929,7 @@ setup_host_firewall() {
 }
 
 clear_entry_forward_rules() {
-  local wan_if exit_ip port
+  local wan_if exit_ip port ssh_ports
   [[ "$(role)" == entry ]] || return 0
   wan_if="$(read_value "$WAN_IF_FILE")"
   exit_ip="$(read_value "$PEER_ADDRESS_FILE")"
@@ -844,6 +948,10 @@ clear_entry_forward_rules() {
     done < "${STATE_DIR}/ports"
   fi
 
+  ssh_ports="$(protected_ssh_ports_csv)"
+  iptables -t nat -D PREROUTING -i "$wan_if" -p tcp -m multiport ! --dports "$ssh_ports" -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
+  iptables -t nat -D PREROUTING -i "$wan_if" -p udp -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
+  # Remove catch-all rules written by releases that only protected port 22.
   iptables -t nat -D PREROUTING -i "$wan_if" -p tcp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
   iptables -t nat -D PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
   iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
@@ -886,7 +994,7 @@ clear_wg_runtime_rules() {
 }
 
 apply_entry_forward_rules() {
-  local wan_if exit_ip port
+  local wan_if exit_ip port ssh_ports
   [[ "$(role)" == entry ]] || return 0
   wan_if="$(read_value "$WAN_IF_FILE")"
   exit_ip="$(read_value "$PEER_ADDRESS_FILE")"
@@ -895,8 +1003,9 @@ apply_entry_forward_rules() {
   clear_entry_forward_rules
 
   if [[ "$(mode)" == global ]]; then
-    iptables -t nat -C PREROUTING -i "$wan_if" -p tcp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || iptables -t nat -A PREROUTING -i "$wan_if" -p tcp ! --dport 22 -j DNAT --to-destination "$exit_ip"
-    iptables -t nat -C PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || iptables -t nat -A PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip"
+    ssh_ports="$(refresh_ssh_ports)"
+    iptables -t nat -C PREROUTING -i "$wan_if" -p tcp -m multiport ! --dports "$ssh_ports" -j DNAT --to-destination "$exit_ip" 2>/dev/null || iptables -t nat -A PREROUTING -i "$wan_if" -p tcp -m multiport ! --dports "$ssh_ports" -j DNAT --to-destination "$exit_ip"
+    iptables -t nat -C PREROUTING -i "$wan_if" -p udp -j DNAT --to-destination "$exit_ip" 2>/dev/null || iptables -t nat -A PREROUTING -i "$wan_if" -p udp -j DNAT --to-destination "$exit_ip"
     iptables -C FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$wan_if" -o "$WG_IF" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
     iptables -C FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WG_IF" -o "$wan_if" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
     iptables -t nat -C POSTROUTING -o "$WG_IF" -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o "$WG_IF" -j MASQUERADE
@@ -906,7 +1015,7 @@ apply_entry_forward_rules() {
   [[ -f "${STATE_DIR}/ports" ]] || return 0
   while read -r port; do
     [[ "$port" =~ ^[0-9]+$ ]] || continue
-    [[ "$port" == 22 ]] && continue
+    is_protected_ssh_port "$port" && continue
     iptables -t nat -C PREROUTING -i "$wan_if" -p tcp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || iptables -t nat -A PREROUTING -i "$wan_if" -p tcp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}"
     iptables -C FORWARD -i "$wan_if" -o "$WG_IF" -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$wan_if" -o "$WG_IF" -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT
     iptables -C FORWARD -i "$WG_IF" -o "$wan_if" -p tcp --sport "$port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || iptables -A FORWARD -i "$WG_IF" -o "$wan_if" -p tcp --sport "$port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
@@ -922,6 +1031,7 @@ ensure_policy_route() {
     warn 'WireGuard 尚未启动，先保存路由模式；启动 WireGuard 后会自动补齐策略路由。'
     return 0
   fi
+  ensure_wan_bind_policy_rule
   ensure_carrier_policy_rule
   if ! fw_policy_rule_exists; then
     ip rule add fwmark "$FW_MARK" table "$ROUTE_TABLE_ID" 2>/dev/null || true
@@ -933,7 +1043,7 @@ ensure_policy_route() {
 }
 
 apply_routing_mode() {
-  local current="$(role)" wan_if remote_host remote_port remote_ip p
+  local current="$(role)" wan_if remote_host remote_port remote_ip p ssh_ports
   [[ "$current" == entry ]] || return 0
   if [[ "$(mode)" == nyanpass ]]; then
     enable_nyanpass_mode
@@ -946,10 +1056,12 @@ apply_routing_mode() {
   clear_mangle_chains
   setup_mangle_chain "$MANGLE_OUT_CHAIN" OUTPUT
   setup_mangle_chain "$MANGLE_PRE_CHAIN" PREROUTING
+  ssh_ports="$(refresh_ssh_ports)"
 
   iptables -t mangle -A "$MANGLE_OUT_CHAIN" -o lo -j RETURN
   iptables -t mangle -A "$MANGLE_OUT_CHAIN" -m mark --mark "$CARRIER_MARK" -j RETURN
-  iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp --dport 22 -j RETURN
+  iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp -m multiport --sports "$ssh_ports" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp -m multiport --dports "$ssh_ports" -j RETURN
   iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p udp --dport 53 -j RETURN
   iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp --dport 53 -j RETURN
   while read -r remote_ip; do
@@ -958,12 +1070,16 @@ apply_routing_mode() {
   done < <(resolve_ipv4s "$remote_host")
 
   if [[ "$(mode)" == global ]]; then
+    iptables -t mangle -A "$MANGLE_OUT_CHAIN" -j CONNMARK --restore-mark
+    iptables -t mangle -A "$MANGLE_OUT_CHAIN" -m mark --mark "$LOCAL_CONN_MARK" -j RETURN
     iptables -t mangle -A "$MANGLE_OUT_CHAIN" -j MARK --set-mark "$FW_MARK"
-    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -p tcp --dport 22 -j RETURN
+    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -p tcp -m multiport --dports "$ssh_ports" -j CONNMARK --set-mark "$LOCAL_CONN_MARK"
+    iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -p tcp -m multiport --dports "$ssh_ports" -j RETURN
     iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -j MARK --set-mark "$FW_MARK"
   elif [[ -f "${STATE_DIR}/ports" ]]; then
     while read -r p; do
       [[ "$p" =~ ^[0-9]+$ ]] || continue
+      is_protected_ssh_port "$p" && continue
       iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp --dport "$p" -j MARK --set-mark "$FW_MARK"
       iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p udp --dport "$p" -j MARK --set-mark "$FW_MARK"
       iptables -t mangle -A "$MANGLE_PRE_CHAIN" -p tcp --dport "$p" -j MARK --set-mark "$FW_MARK"
@@ -978,13 +1094,14 @@ set_mode() {
   [[ "$requested" == global || "$requested" == split ]] || { err '模式只能是 global 或 split'; return 1; }
   write_value "$MODE_FILE" "$requested"
   apply_routing_mode
+  write_entry_wg_config
   ok "已切换到 $( [[ "$requested" == global ]] && printf '全局' || printf '分流' )模式"
 }
 
 enable_global_mode() { set_mode global; }
 enable_split_mode() { set_mode split; }
 enable_nyanpass_mode() {
-  local wan_if remote_host remote_port remote_ip dns_ip
+  local wan_if remote_host remote_port remote_ip dns_ip ssh_ports
   local -a remote_ips=()
   [[ "$(get_role)" == entry ]] || { err '当前机器不是入口服务器'; return 1; }
   wan_if="$(read_value "$WAN_IF_FILE")"
@@ -1007,6 +1124,7 @@ enable_nyanpass_mode() {
   clear_entry_forward_rules
   clear_mangle_chains
   clear_script_nyanpass_routing_rules
+  ssh_ports="$(refresh_ssh_ports)"
 
   iptables -t mangle -N "$NYANPASS_IN_CHAIN" 2>/dev/null || true
   iptables -t mangle -N "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
@@ -1015,12 +1133,12 @@ enable_nyanpass_mode() {
 
   # Public inbound connections stay local to NyanPass. Their replies retain
   # connmark 0x2 and therefore continue through the entry server's main route.
-  iptables -t mangle -A "$NYANPASS_IN_CHAIN" -i "$wan_if" -m addrtype --dst-type LOCAL -m conntrack --ctstate NEW -j CONNMARK --set-mark 0x2
+  iptables -t mangle -A "$NYANPASS_IN_CHAIN" -i "$wan_if" -m addrtype --dst-type LOCAL -j CONNMARK --set-mark "$LOCAL_CONN_MARK"
 
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -o lo -j RETURN
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark "$CARRIER_MARK" -j RETURN
-  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --sport 22 -j RETURN
-  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --dport 22 -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp -m multiport --sports "$ssh_ports" -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp -m multiport --dports "$ssh_ports" -j RETURN
   for remote_ip in "${remote_ips[@]}"; do
     iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -d "${remote_ip}/32" -p tcp --dport "$remote_port" -j RETURN
   done
@@ -1031,7 +1149,7 @@ enable_nyanpass_mode() {
   done < <(awk '$1 == "nameserver" {print $2}' /etc/resolv.conf 2>/dev/null | sort -u)
 
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -j CONNMARK --restore-mark
-  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark 0x2 -j RETURN
+  iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark "$LOCAL_CONN_MARK" -j RETURN
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m mark --mark "$FW_MARK" -j RETURN
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
   iptables -t mangle -A "$NYANPASS_OUT_CHAIN" -m conntrack --ctstate NEW -j MARK --set-mark "$FW_MARK"
@@ -1041,12 +1159,18 @@ enable_nyanpass_mode() {
   iptables -t mangle -C OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null || iptables -t mangle -I OUTPUT 1 -j "$NYANPASS_OUT_CHAIN"
   ip link set dev "$WG_IF" mtu 1280 2>/dev/null || true
   write_value "$MODE_FILE" nyanpass
+  write_entry_wg_config
   warn '已建立连接不会自动迁移；请重启 NyanPass 服务或等待连接重新建立。'
 }
 
 add_port() {
   local port="$1"
   valid_port "$port" || { err '端口无效'; return 1; }
+  refresh_ssh_ports >/dev/null
+  if is_protected_ssh_port "$port"; then
+    err "端口 ${port} 是 SSH 直连保护端口，不能加入入口分流"
+    return 1
+  fi
   touch "${STATE_DIR}/ports"; chmod 600 "${STATE_DIR}/ports"
   grep -qxF "$port" "${STATE_DIR}/ports" || printf '%s\n' "$port" >> "${STATE_DIR}/ports"
   apply_routing_mode
@@ -1312,7 +1436,7 @@ socket_port_is_bound() {
 }
 
 show_health_summary() {
-  local current_role service port handshake now age recent_handshake='n'
+  local current_role service port handshake now age wan_if recent_handshake='n'
   current_role="$(get_role)"
   if [[ "$current_role" == exit ]]; then
     service="$XRAY_EXIT_SERVICE"
@@ -1345,6 +1469,7 @@ show_health_summary() {
   fi
 
   if [[ "$current_role" == entry ]]; then
+    wan_if="$(read_value "$WAN_IF_FILE")"
     if fw_policy_rule_exists && ip route show table "$ROUTE_TABLE_ID" 2>/dev/null | grep -Eq "^default .*dev ${WG_IF}([[:space:]]|$)"; then
       echo "  ✅ WireGuard 策略路由: 正常"
     else
@@ -1354,6 +1479,11 @@ show_health_summary() {
       echo "  ✅ WireGuard 出口 NAT: 正常"
     else
       echo "  ❌ WireGuard 出口 NAT: 缺失"
+    fi
+    if [[ -n "$wan_if" ]] && wan_bind_policy_rule_exists "$wan_if"; then
+      echo "  ✅ 显式绑定 ${wan_if} 的直连旁路: 正常"
+    else
+      echo "  ❌ 显式 WAN 直连旁路: 缺失"
     fi
   fi
 
@@ -1381,6 +1511,7 @@ show_status() {
   [[ -f "$SHORT_ID_FILE" ]] && echo "Reality Short ID: $(read_value "$SHORT_ID_FILE")"
   [[ -f "$WG_LISTEN_PORT_FILE" ]] && echo "WG UDP端口: $(read_value "$WG_LISTEN_PORT_FILE")"
   [[ -f "$WG_LOCAL_PORT_FILE" ]] && echo "本地Reality UDP端口: $(read_value "$WG_LOCAL_PORT_FILE")"
+  [[ "$(get_role)" == entry ]] && echo "SSH 直连保护端口: $(protected_ssh_ports_csv)"
   echo
   show_health_summary
   echo
@@ -1410,6 +1541,7 @@ stop_all() {
   ip route flush table "$ROUTE_TABLE_ID" 2>/dev/null || true
   clear_fw_policy_rules
   clear_carrier_policy_rule
+  clear_wan_bind_policy_rule
   ok '服务已停止'
 }
 
