@@ -231,17 +231,46 @@ resolve_ipv4s() {
   fi
 }
 
+policy_rule_exists() {
+  local wanted_mark="$1" wanted_table="$2" wanted_priority="${3:-}"
+  ip rule show 2>/dev/null | awk \
+    -v wanted_mark="$wanted_mark" \
+    -v wanted_table="$wanted_table" \
+    -v wanted_priority="$wanted_priority" '
+      {
+        priority = $1
+        sub(/:$/, "", priority)
+        if (wanted_priority != "" && priority != wanted_priority) next
+        mark_ok = 0
+        table_ok = 0
+        for (i = 1; i <= NF; i++) {
+          if ($i == "fwmark" && i < NF) {
+            split($(i + 1), mark_parts, "/")
+            if (tolower(mark_parts[1]) == tolower(wanted_mark)) mark_ok = 1
+          }
+          if (($i == "lookup" || $i == "table") && i < NF && $(i + 1) == wanted_table) table_ok = 1
+        }
+        if (mark_ok && table_ok) found = 1
+      }
+      END { exit(found ? 0 : 1) }
+    '
+}
+
 carrier_policy_rule_exists() {
-  ip rule show 2>/dev/null | grep -Eq "^[[:space:]]*${CARRIER_RULE_PRIORITY}:.*fwmark ${CARRIER_MARK}(/0xffffffff)?([[:space:]]|$).*lookup main([[:space:]]|$)"
+  policy_rule_exists "$CARRIER_MARK" main "$CARRIER_RULE_PRIORITY"
+}
+
+fw_policy_rule_exists() {
+  policy_rule_exists "$FW_MARK" "$ROUTE_TABLE_ID"
 }
 
 ensure_carrier_policy_rule() {
   carrier_policy_rule_exists && return 0
-  if ip rule show 2>/dev/null | grep -Eq "^[[:space:]]*${CARRIER_RULE_PRIORITY}:"; then
+  if ip rule show 2>/dev/null | awk -v wanted="${CARRIER_RULE_PRIORITY}:" '$1 == wanted {found = 1} END {exit(found ? 0 : 1)}'; then
     err "ip rule 优先级 ${CARRIER_RULE_PRIORITY} 已被其他规则占用，无法保护 Reality 载体连接"
     return 1
   fi
-  ip rule add priority "$CARRIER_RULE_PRIORITY" fwmark "$CARRIER_MARK" table main
+  ip rule add priority "$CARRIER_RULE_PRIORITY" fwmark "$CARRIER_MARK" table main 2>/dev/null || true
   carrier_policy_rule_exists || { err 'Reality 载体 main 路由规则创建失败'; return 1; }
 }
 
@@ -528,7 +557,7 @@ write_entry_wg_config() {
   ensure_wg_conf_is_owned
   {
     printf '[Interface]\nAddress = %s\nPrivateKey = %s\nTable = off\nMTU = 1280\n' "$entry_addr" "$private"
-    printf 'PostUp = ip rule show | grep -Eq "^[[:space:]]*%s:.*fwmark %s(/0xffffffff)?([[:space:]]|$).*lookup main([[:space:]]|$)" || ip rule add priority %s fwmark %s table main; ip rule add fwmark %s table %s 2>/dev/null || true; ip route replace default dev %s table %s; ip route replace %s dev %s table %s; ' "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$WG_IF" "$ROUTE_TABLE_ID" "${exit_addr%%/*}" "$WG_IF" "$ROUTE_TABLE_ID"
+    printf 'PostUp = ip rule add priority %s fwmark %s table main 2>/dev/null || true; ip rule add fwmark %s table %s 2>/dev/null || true; ip route replace default dev %s table %s; ip route replace %s dev %s table %s; ' "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$WG_IF" "$ROUTE_TABLE_ID" "${exit_addr%%/*}" "$WG_IF" "$ROUTE_TABLE_ID"
     printf 'iptables -t nat -C POSTROUTING -o %s -j MASQUERADE 2>/dev/null || iptables -t nat -A POSTROUTING -o %s -j MASQUERADE\n' "$WG_IF" "$WG_IF"
     printf 'PostDown = ip rule del priority %s fwmark %s table main 2>/dev/null || true; ip rule del fwmark %s table %s 2>/dev/null || true; ip route flush table %s 2>/dev/null || true; iptables -t nat -D POSTROUTING -o %s -j MASQUERADE 2>/dev/null || true\n' "$CARRIER_RULE_PRIORITY" "$CARRIER_MARK" "$FW_MARK" "$ROUTE_TABLE_ID" "$ROUTE_TABLE_ID" "$WG_IF"
     printf '\n[Peer]\nPublicKey = %s\nEndpoint = 127.0.0.1:%s\nAllowedIPs = 0.0.0.0/0\nPersistentKeepalive = 20\n' "$exit_pub" "$local_port"
@@ -731,11 +760,11 @@ clear_mangle_chains() {
   for chain in "$MANGLE_OUT_CHAIN" "$MANGLE_PRE_CHAIN"; do
     for hook in OUTPUT PREROUTING; do
       while iptables -t mangle -C "$hook" -j "$chain" 2>/dev/null; do
-        iptables -t mangle -D "$hook" -j "$chain" 2>/dev/null || true
+        iptables -t mangle -D "$hook" -j "$chain" >/dev/null 2>&1 || true
       done
     done
-    iptables -t mangle -F "$chain" 2>/dev/null || true
-    iptables -t mangle -X "$chain" 2>/dev/null || true
+    iptables -t mangle -F "$chain" >/dev/null 2>&1 || true
+    iptables -t mangle -X "$chain" >/dev/null 2>&1 || true
   done
 }
 
@@ -800,15 +829,17 @@ clear_entry_forward_rules() {
   exit_ip="${exit_ip%%/*}"
   [[ -n "$wan_if" && -n "$exit_ip" ]] || return 0
 
-  while read -r port; do
-    [[ "$port" =~ ^[0-9]+$ ]] || continue
-    iptables -t nat -D PREROUTING -i "$wan_if" -p tcp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
-    iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -p tcp --sport "$port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
-    iptables -t nat -D PREROUTING -i "$wan_if" -p udp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
-    iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
-    iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -p udp --sport "$port" -j ACCEPT 2>/dev/null || true
-  done < "${STATE_DIR}/ports" 2>/dev/null || true
+  if [[ -f "${STATE_DIR}/ports" ]]; then
+    while read -r port; do
+      [[ "$port" =~ ^[0-9]+$ ]] || continue
+      iptables -t nat -D PREROUTING -i "$wan_if" -p tcp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+      iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -p tcp --dport "$port" -m conntrack --ctstate NEW,ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -p tcp --sport "$port" -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT 2>/dev/null || true
+      iptables -t nat -D PREROUTING -i "$wan_if" -p udp --dport "$port" -j DNAT --to-destination "${exit_ip}:${port}" 2>/dev/null || true
+      iptables -D FORWARD -i "$wan_if" -o "$WG_IF" -p udp --dport "$port" -j ACCEPT 2>/dev/null || true
+      iptables -D FORWARD -i "$WG_IF" -o "$wan_if" -p udp --sport "$port" -j ACCEPT 2>/dev/null || true
+    done < "${STATE_DIR}/ports"
+  fi
 
   iptables -t nat -D PREROUTING -i "$wan_if" -p tcp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
   iptables -t nat -D PREROUTING -i "$wan_if" -p udp ! --dport 22 -j DNAT --to-destination "$exit_ip" 2>/dev/null || true
@@ -855,7 +886,10 @@ ensure_policy_route() {
     return 0
   fi
   ensure_carrier_policy_rule
-  ip rule show 2>/dev/null | grep -q "fwmark ${FW_MARK} lookup ${ROUTE_TABLE_ID}" || ip rule add fwmark "$FW_MARK" table "$ROUTE_TABLE_ID"
+  if ! fw_policy_rule_exists; then
+    ip rule add fwmark "$FW_MARK" table "$ROUTE_TABLE_ID" 2>/dev/null || true
+    fw_policy_rule_exists || { err 'WireGuard 策略路由规则创建失败'; return 1; }
+  fi
   ip route replace default dev "$WG_IF" table "$ROUTE_TABLE_ID"
 }
 
@@ -867,6 +901,7 @@ apply_routing_mode() {
     return 0
   fi
   wan_if="$(read_value "$WAN_IF_FILE")"; remote_host="$(read_value "$REMOTE_HOST_FILE")"; remote_port="$(read_value "$REMOTE_PORT_FILE")"
+  ensure_policy_route
   clear_script_nyanpass_routing_rules
   apply_entry_forward_rules
   clear_mangle_chains
@@ -887,8 +922,7 @@ apply_routing_mode() {
     iptables -t mangle -A "$MANGLE_OUT_CHAIN" -j MARK --set-mark "$FW_MARK"
     iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -p tcp --dport 22 -j RETURN
     iptables -t mangle -A "$MANGLE_PRE_CHAIN" -i "$wan_if" -j MARK --set-mark "$FW_MARK"
-  else
-    [[ -f "${STATE_DIR}/ports" ]] || return 0
+  elif [[ -f "${STATE_DIR}/ports" ]]; then
     while read -r p; do
       [[ "$p" =~ ^[0-9]+$ ]] || continue
       iptables -t mangle -A "$MANGLE_OUT_CHAIN" -p tcp --dport "$p" -j MARK --set-mark "$FW_MARK"
@@ -898,7 +932,6 @@ apply_routing_mode() {
     done < "${STATE_DIR}/ports"
   fi
   write_value "$MODE_FILE" "$(mode)"
-  ensure_policy_route
 }
 
 set_mode() {
@@ -931,10 +964,10 @@ enable_nyanpass_mode() {
     return 1
   fi
 
+  ensure_policy_route
   clear_entry_forward_rules
   clear_mangle_chains
   clear_script_nyanpass_routing_rules
-  ensure_policy_route
 
   iptables -t mangle -N "$NYANPASS_IN_CHAIN" 2>/dev/null || true
   iptables -t mangle -N "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
@@ -992,15 +1025,15 @@ remove_forward_port_mapping() { apply_entry_forward_rules; }
 clear_script_owned_entry_forward_rules() { clear_entry_forward_rules; }
 clear_script_nyanpass_routing_rules() {
   while iptables -t mangle -C OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null; do
-    iptables -t mangle -D OUTPUT -j "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -j "$NYANPASS_OUT_CHAIN" >/dev/null 2>&1 || true
   done
   while iptables -t mangle -C PREROUTING -j "$NYANPASS_IN_CHAIN" 2>/dev/null; do
-    iptables -t mangle -D PREROUTING -j "$NYANPASS_IN_CHAIN" 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -j "$NYANPASS_IN_CHAIN" >/dev/null 2>&1 || true
   done
-  iptables -t mangle -F "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
-  iptables -t mangle -X "$NYANPASS_OUT_CHAIN" 2>/dev/null || true
-  iptables -t mangle -F "$NYANPASS_IN_CHAIN" 2>/dev/null || true
-  iptables -t mangle -X "$NYANPASS_IN_CHAIN" 2>/dev/null || true
+  iptables -t mangle -F "$NYANPASS_OUT_CHAIN" >/dev/null 2>&1 || true
+  iptables -t mangle -X "$NYANPASS_OUT_CHAIN" >/dev/null 2>&1 || true
+  iptables -t mangle -F "$NYANPASS_IN_CHAIN" >/dev/null 2>&1 || true
+  iptables -t mangle -X "$NYANPASS_IN_CHAIN" >/dev/null 2>&1 || true
 }
 clear_legacy_output_rules() { :; }
 clear_mark_rules() { :; }
@@ -1222,8 +1255,25 @@ update_exit_peer() {
   ok '出口 WireGuard 对端已更新'
 }
 
+socket_port_is_bound() {
+  local protocol="$1" port="$2"
+  [[ "$port" =~ ^[0-9]+$ ]] || return 1
+  if [[ "$protocol" == tcp ]]; then
+    ss -H -lnt 2>/dev/null
+  else
+    ss -H -aun 2>/dev/null
+  fi | awk -v port="$port" '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i ~ (":" port "$")) found = 1
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 show_health_summary() {
-  local current_role service port handshake now age
+  local current_role service port handshake now age recent_handshake='n'
   current_role="$(get_role)"
   if [[ "$current_role" == exit ]]; then
     service="$XRAY_EXIT_SERVICE"
@@ -1233,23 +1283,29 @@ show_health_summary() {
     port="$(read_value "$WG_LOCAL_PORT_FILE")"
   fi
 
+  handshake="$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{max=0} $2>max{max=$2} END{print max}' || true)"
+  now="$(date +%s)"
+  if [[ "$handshake" =~ ^[0-9]+$ ]] && ((handshake > 0 && now - handshake <= 180)); then
+    recent_handshake='y'
+  fi
+
   echo "健康检查:"
   if systemctl is-active --quiet "$service" 2>/dev/null; then
     echo "  ✅ Xray 服务: active"
   else
     echo "  ❌ Xray 服务: inactive"
   fi
-  if [[ "$current_role" == exit ]] && ss -lnt 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
+  if [[ "$current_role" == exit ]] && socket_port_is_bound tcp "$port"; then
     echo "  ✅ Reality TCP ${port}: 正在监听"
-  elif [[ "$current_role" == entry ]] && ss -lun 2>/dev/null | grep -Eq ":${port}[[:space:]]"; then
+  elif [[ "$current_role" == entry ]] && socket_port_is_bound udp "$port"; then
     echo "  ✅ 本地 Xray UDP ${port}: 正在监听"
+  elif [[ "$current_role" == entry && "$recent_handshake" == y ]]; then
+    echo "  ⚠️  ss 未显示 UDP ${port}，但 WireGuard 存在近期有效握手"
   else
     echo "  ❌ 期望端口 ${port:-未配置}: 未监听"
   fi
 
-  handshake="$(wg show "$WG_IF" latest-handshakes 2>/dev/null | awk 'BEGIN{max=0} $2>max{max=$2} END{print max}' || true)"
   if [[ "$handshake" =~ ^[0-9]+$ ]] && ((handshake > 0)); then
-    now="$(date +%s)"
     age=$((now - handshake))
     if ((age <= 180)); then
       echo "  ✅ WireGuard 最近握手: ${age} 秒前"
